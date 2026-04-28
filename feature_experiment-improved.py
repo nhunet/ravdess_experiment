@@ -1,8 +1,6 @@
 """
 =============================================================================
 THỰC NGHIỆM SO SÁNH ĐẶC TRƯNG ÂM THANH – SPEECH EMOTION RECOGNITION
-Đề tài: Hệ thống gợi ý sản phẩm dựa trên phân tích giọng nói và cảm xúc
-Học viên: Nguyễn Tấn Nhu | GVHD: TS. Bùi Thanh Hùng
 =============================================================================
 
 Tương thích: Python 3.9 – 3.14

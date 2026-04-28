@@ -1,8 +1,6 @@
 """
 =============================================================================
 THỰC NGHIỆM MỤC 2 – PRETRAINED AUDIO EMBEDDINGS CHO SPEECH EMOTION RECOGNITION
-Đề tài: Hệ thống gợi ý sản phẩm dựa trên phân tích giọng nói và cảm xúc
-Học viên: Nguyễn Tấn Nhu | GVHD: TS. Bùi Thanh Hùng
 =============================================================================
 
 Mục tiêu:
