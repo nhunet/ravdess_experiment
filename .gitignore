@@ -10,6 +10,9 @@ RAVDESS/
 # Ignore result/output folder
 Result/
 
+# MacOS files
+.DS_Store
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
