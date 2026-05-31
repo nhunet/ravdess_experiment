@@ -95,7 +95,7 @@ N_MELS:       int   = 128
 N_FFT:        int   = 2048
 HOP_LENGTH:   int   = 512
 RANDOM_SEED:  int   = 42
-DL_EPOCHS:    int   = 30
+DL_EPOCHS:    int   = 100
 DL_BATCH:     int   = 32
 
 EMOTIONS: dict[int, str] = {
@@ -559,10 +559,10 @@ def _train_torch(X: np.ndarray, y_enc: np.ndarray,
 
         best_acc   = 0.0
         no_improve = 0
-        patience   = 8
+        patience   = 25
         t0         = time.time()
 
-        for _ in range(DL_EPOCHS):
+        for epoch in range(DL_EPOCHS):
             model.train()
             for xb, yb in tr_dl:
                 xb, yb = xb.to(device), yb.to(device)
@@ -579,6 +579,7 @@ def _train_torch(X: np.ndarray, y_enc: np.ndarray,
                     total   += yb.size(0)
 
             val_acc = correct / total
+            print(f"Epoch {epoch+1}/{DL_EPOCHS}, Val Acc: {val_acc:.4f}")
             if val_acc > best_acc:
                 best_acc   = val_acc
                 no_improve = 0
@@ -637,13 +638,13 @@ def _train_tf(X: np.ndarray, y_enc: np.ndarray,
         m.compile(optimizer=tf.keras.optimizers.Adam(1e-3),
                   loss="sparse_categorical_crossentropy", metrics=["accuracy"])
         es = tf.keras.callbacks.EarlyStopping(
-            monitor="val_accuracy", patience=8,
+            monitor="val_accuracy", patience=25,
             restore_best_weights=True, verbose=0,
         )
         t0   = time.time()
         hist = m.fit(X_tr_3d, y_tr, validation_data=(X_val_3d, y_val),
                      epochs=DL_EPOCHS, batch_size=DL_BATCH,
-                     callbacks=[es], verbose=0)
+                     callbacks=[es], verbose=1)
         return max(hist.history["val_accuracy"]), time.time() - t0
     except ImportError:
         return None, None
@@ -704,10 +705,10 @@ def _train_torch_2d(
 
         best_acc   = 0.0
         no_improve = 0
-        patience   = 10
+        patience   = 25
         t0         = time.time()
 
-        for _ in range(DL_EPOCHS):
+        for epoch in range(DL_EPOCHS):
             model.train()
             for xb, yb in tr_dl:
                 xb, yb = xb.to(device), yb.to(device)
@@ -724,6 +725,7 @@ def _train_torch_2d(
                     total   += yb.size(0)
             val_acc = correct / total
             scheduler.step(val_acc)
+            print(f"Epoch {epoch+1}/{DL_EPOCHS}, Val Acc: {val_acc:.4f}")
 
             if val_acc > best_acc:
                 best_acc   = val_acc
@@ -743,7 +745,7 @@ def _train_torch_2d(
 # ============================================================================
 
 def plot_feature_comparison(df: pd.DataFrame,
-                             save_path: str = "results_feature_comparison.png") -> None:
+                             save_path: str = "feature_experience/results_feature_comparison.png") -> None:
     fig, axes = plt.subplots(1, 2, figsize=(16, 7))
     fig.suptitle(
         "So sánh hiệu quả các đặc trưng âm thanh – Speech Emotion Recognition\n"
@@ -780,7 +782,7 @@ def plot_confusion_matrix_best(
     y_enc: np.ndarray,
     le: LabelEncoder,
     best_row: pd.Series,
-    save_path: str = "confusion_matrix_best.png",
+    save_path: str = "feature_experience/confusion_matrix_best.png",
 ) -> None:
     """
     Vẽ confusion matrix cho combination Feature+Model tốt nhất.
@@ -839,7 +841,7 @@ def plot_confusion_matrix_best(
 
 
 def plot_sample_features(y: np.ndarray, sr: int = SR,
-                          save_path: str = "sample_features_visualization.png") -> None:
+                          save_path: str = "feature_experience/sample_features_visualization.png") -> None:
     fig, axes = plt.subplots(3, 2, figsize=(14, 12))
     fig.suptitle("Trực quan hóa đặc trưng âm thanh (1 sample)",
                  fontsize=13, fontweight="bold")
@@ -899,6 +901,8 @@ def main() -> None:
     print(f"  Python {sys.version_info.major}.{sys.version_info.minor}"
           f"  |  DL: {DL_BACKEND}")
     print("=" * 65)
+
+    os.makedirs("feature_experience", exist_ok=True)
 
     signals, labels, _ = load_ravdess(RAVDESS_PATH)
     le    = LabelEncoder()
@@ -1048,9 +1052,9 @@ def main() -> None:
     print("  HOÀN THÀNH! Output:")
     print("  • results_full.csv")
     print("  • results_pivot.csv")
-    print("  • results_feature_comparison.png")
-    print("  • confusion_matrix_best.png")
-    print("  • sample_features_visualization.png")
+    print("  • feature_experience/results_feature_comparison.png")
+    print("  • feature_experience/confusion_matrix_best.png")
+    print("  • feature_experience/sample_features_visualization.png")
     print("=" * 65 + "\n")
 
 

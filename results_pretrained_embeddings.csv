@@ -1,0 +1,17 @@
+Embedding,Classifier,Accuracy(%),Std(%),F1_macro(%),Dim,Category
+Wav2Vec2-base,SVM (RBF),68.82,2.42,68.29,768,Pretrained
+Wav2Vec2-base,Random Forest,50.76,2.84,48.15,768,Pretrained
+HuBERT-base,SVM (RBF),81.94,2.38,81.52,768,Pretrained
+HuBERT-base,Random Forest,62.99,2.76,60.74,768,Pretrained
+MERT-v1-95M,SVM (RBF),78.06,2.35,77.2,768,Pretrained
+MERT-v1-95M,Random Forest,58.89,2.25,56.07,768,Pretrained
+Whisper-base,SVM (RBF),80.28,2.25,79.8,512,Pretrained
+Whisper-base,Random Forest,65.49,3.23,64.68,512,Pretrained
+MFCC (baseline),SVM (RBF),68.54,4.2,67.78,240,Baseline
+MFCC (baseline),Random Forest,55.9,3.34,53.52,240,Baseline
+[Fusion] HuBERT + MERT,SVM (RBF),83.68,3.05,83.02,1536,Fusion
+[Fusion] HuBERT + Whisper,SVM (RBF),84.1,3.17,83.71,1280,Fusion
+[Fusion] HuBERT + MFCC,SVM (RBF),83.54,2.45,83.07,1008,Fusion
+[Fusion] HuBERT + MERT + Whisper,SVM (RBF),85.0,3.52,84.59,2048,Fusion
+[Fusion] All Speech Models,SVM (RBF),84.03,3.76,83.56,2816,Fusion
+[Fusion] HuBERT + MERT + MFCC,SVM (RBF),83.33,2.8,82.67,1776,Fusion

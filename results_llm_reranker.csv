@@ -1,0 +1,9 @@
+Emotion,Initial_NDCG@5,Reranked_NDCG@5,Improvement_NDCG,Initial_HR@5,Reranked_HR@5,LLM_Reasoning
+angry,1.0,1.0,0.0,1.0,1.0,"Dựa trên cảm xúc 'angry', hệ thống ưu tiên sản phẩm giúp Giúp xả stress và bình tâm."
+sad,0.7328,0.9675,0.2346,1.0,1.0,"Dựa trên cảm xúc 'sad', hệ thống ưu tiên sản phẩm giúp Mang lại cảm giác an ủi và ấm áp."
+happy,1.0,0.906,-0.094,1.0,1.0,"Dựa trên cảm xúc 'happy', hệ thống ưu tiên sản phẩm giúp Tăng cường niềm vui và năng lượng tích cực."
+fearful,0.7123,0.9675,0.2552,1.0,1.0,"Dựa trên cảm xúc 'fearful', hệ thống ưu tiên sản phẩm giúp Giúp thư giãn và giảm lo âu."
+neutral,0.906,0.9675,0.0614,1.0,1.0,"Dựa trên cảm xúc 'neutral', hệ thống ưu tiên sản phẩm giúp Phù hợp cho trạng thái ổn định, tập trung."
+calm,1.0,0.9675,-0.0325,1.0,1.0,"Dựa trên cảm xúc 'calm', hệ thống ưu tiên sản phẩm giúp Duy trì sự bình yên và thư thái."
+disgust,0.4693,0.4693,0.0,1.0,1.0,"Dựa trên cảm xúc 'disgust', hệ thống ưu tiên sản phẩm giúp Chuyển hướng sự chú ý sang điều tích cực."
+surprised,1.0,1.0,0.0,1.0,1.0,"Dựa trên cảm xúc 'surprised', hệ thống ưu tiên sản phẩm giúp Khai thác sự tò mò và năng lượng mới."
