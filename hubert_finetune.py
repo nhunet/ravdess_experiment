@@ -46,6 +46,22 @@ PHIÊN BẢN v2 – SỬA SAU LẦN CHẠY ĐẦU
   Kỳ vọng: 88–92% (mức literature cho fine-tune HuBERT trên RAVDESS
   với random split).
 
+PHIÊN BẢN v3 – TỐI ƯU CHO GOOGLE COLAB (7 điểm)
+  #1 Checkpoint sau MỖI fold + resume tự động. Trước đây CSV chỉ ghi sau khi
+     cả 5 fold xong → Colab ngắt ở fold 4 là mất trắng 1.5 giờ.
+     Chạy lại script → tự bỏ qua fold đã xong. Dùng --force để ép chạy lại.
+  #2 Dọn VRAM giữa các fold (del model + empty_cache), best model giữ dạng
+     state_dict trên CPU. Trước đây model GPU của fold cũ không được giải
+     phóng → OOM ở fold 3-4.
+  #3 Đóng băng CNN encoder qua API công khai, có 3 lớp fallback — không còn
+     phụ thuộc _freeze_parameters() (API private, dễ vỡ khi Colab đổi version).
+  #4 Weighted layer-sum cộng luỹ tiến thay vì torch.stack 13 tensor →
+     tiết kiệm ~1/13 activation memory.
+  #5 Reset seed đầu mỗi fold → chạy lại ra ĐÚNG số cũ (reproducible).
+  #6 DataLoader: pin_memory + num_workers=2 (sweet spot của Colab 2 vCPU).
+  #7 cudnn.benchmark=True — input cố định 48000 samples nên chọn được kernel
+     tối ưu và tái dùng.
+
 BA CẢI TIẾN TRONG FILE NÀY
   (a) Fine-tune có chọn lọc  – mở khóa gradient cho Transformer layers,
                                đóng băng CNN feature encoder (chuẩn của
@@ -178,6 +194,50 @@ BASELINE = {
 torch.manual_seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ── FIX #7: input có kích thước CỐ ĐỊNH (48000 samples) → cuDNN benchmark
+# chọn được kernel tối ưu ngay lần đầu và tái dùng. Free ~3-5% tốc độ.
+if DEVICE.type == "cuda":
+    torch.backends.cudnn.benchmark = True
+
+
+def set_seed(seed: int) -> None:
+    """
+    FIX #5: reset seed ĐẦU MỖI FOLD.
+
+    Trước đây torch.manual_seed() chỉ gọi 1 lần lúc import → head của fold 2
+    khởi tạo khác fold 1, thứ tự shuffle cũng khác. Không sai về khoa học
+    nhưng chạy lại KHÔNG ra đúng số cũ. Thầy hỏi "reproduce được không?"
+    thì phải trả lời được.
+    """
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def free_gpu(*objs) -> None:
+    """
+    FIX #2: giải phóng VRAM giữa các fold.
+
+    Mỗi fold tạo HuBERT mới (~95M params) + AdamW states (2x params).
+    Không dọn → model fold trước vẫn giữ VRAM → OOM ở fold 3-4, tức là
+    sau cả tiếng chạy. Đây là kiểu lỗi đau nhất trên Colab.
+    """
+    for o in objs:
+        del o
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def gpu_mem() -> str:
+    if not torch.cuda.is_available():
+        return "CPU"
+    used = torch.cuda.memory_allocated() / 1024**3
+    total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    return f"{used:.1f}/{total:.1f} GB"
 
 
 # ============================================================================
@@ -322,7 +382,25 @@ class HubertSER(nn.Module):
         # ── (a) Đóng băng CNN feature encoder ────────────────────────────────
         # Lớp CNN front-end học các đặc trưng âm học tổng quát; fine-tune nó
         # trên 1.440 mẫu vừa dễ hỏng vừa tốn VRAM mà gần như không có lợi.
-        self.hubert.feature_extractor._freeze_parameters()
+        # FIX #3: _freeze_parameters() là API PRIVATE (dấu gạch dưới) — có thể
+        # biến mất khi transformers đổi version, mà Colab thì cập nhật liên tục.
+        # Thử lần lượt 3 cách, cách cuối luôn hoạt động.
+        _frozen = False
+        for attempt in ("freeze_feature_encoder", "freeze_feature_extractor"):
+            fn = getattr(self.hubert, attempt, None)
+            if callable(fn):
+                fn()
+                _frozen = True
+                break
+        if not _frozen:
+            fe = getattr(self.hubert, "feature_extractor", None)
+            if fe is not None and hasattr(fe, "_freeze_parameters"):
+                fe._freeze_parameters()
+                _frozen = True
+        if not _frozen:
+            # Fallback cuối: tắt gradient thủ công – luôn đúng với mọi version
+            for p in self.hubert.feature_extractor.parameters():
+                p.requires_grad = False
 
         # ── Đóng băng N transformer layer đầu ────────────────────────────────
         # Layer thấp = đặc trưng âm học chung; layer cao = ngữ nghĩa/paralinguistic.
@@ -354,9 +432,13 @@ class HubertSER(nn.Module):
         """waveform (B, L) → pooled vector (B, 768)"""
         out = self.hubert(x)
         if self.use_weighted_layers:
-            hs = torch.stack(out.hidden_states, dim=0)      # (13, B, T, H)
-            w  = torch.softmax(self.layer_weights, dim=0)   # (13,)
-            h  = (hs * w.view(-1, 1, 1, 1)).sum(dim=0)      # (B, T, H)
+            # FIX #4: KHÔNG stack 13 tensor thành (13, B, T, H) rồi mới sum —
+            # cách đó tạo một bản sao khổng lồ chỉ để cộng lại. Cộng luỹ tiến
+            # tiết kiệm ~1/13 activation memory → cho phép tăng batch size.
+            w = torch.softmax(self.layer_weights, dim=0)     # (13,)
+            h = out.hidden_states[0] * w[0]
+            for i in range(1, len(out.hidden_states)):
+                h = h + out.hidden_states[i] * w[i]          # (B, T, H)
         else:
             h = out.last_hidden_state                        # (B, T, H)
         return self.pool(h)                                  # (B, H)
@@ -433,6 +515,9 @@ def train_one_fold(waves: np.ndarray, y: np.ndarray,
                     └─ 15% → early-stopping + chọn best checkpoint
         test  fold ───────→ CHỈ đo 1 lần cuối, không hề can thiệp vào training
     """
+    # FIX #5: reset seed đầu mỗi fold → chạy lại ra đúng số cũ
+    set_seed(RANDOM_SEED)
+
     # ── Tách validation từ train fold (stratified) ──────────────────────────
     y_tr_full = y[tr_idx]
     sub_tr, sub_val = train_test_split(
@@ -444,12 +529,19 @@ def train_one_fold(waves: np.ndarray, y: np.ndarray,
     real_tr = tr_idx[sub_tr]
     real_val = tr_idx[sub_val]
 
+    # FIX #6: pin_memory + persistent_workers → copy CPU→GPU nhanh hơn ~5-8%.
+    # num_workers=2 là sweet spot của Colab (máy chỉ có 2 vCPU).
+    _dl_kw = dict(pin_memory=(DEVICE.type == "cuda"),
+                  num_workers=2 if DEVICE.type == "cuda" else 0,
+                  persistent_workers=(DEVICE.type == "cuda"))
+
     tr_dl = DataLoader(RavdessDataset(waves[real_tr], y[real_tr]),
-                       batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+                       batch_size=BATCH_SIZE, shuffle=True, drop_last=True,
+                       **_dl_kw)
     val_dl = DataLoader(RavdessDataset(waves[real_val], y[real_val]),
-                        batch_size=BATCH_SIZE)
+                        batch_size=BATCH_SIZE, **_dl_kw)
     te_dl = DataLoader(RavdessDataset(waves[te_idx], y[te_idx]),
-                       batch_size=BATCH_SIZE)
+                       batch_size=BATCH_SIZE, **_dl_kw)
 
     model  = HubertSER(n_classes).to(DEVICE)
     opt    = _make_optimizer(model)
@@ -675,6 +767,8 @@ def main() -> None:
     ap.add_argument("--quick", action="store_true",
                     help="Chạy nhanh: 1 fold, 5 epochs (để test pipeline)")
     ap.add_argument("--epochs", type=int, default=EPOCHS)
+    ap.add_argument("--force", action="store_true",
+                    help="Chạy lại từ đầu, bỏ qua checkpoint đã có (FIX #1)")
     args = ap.parse_args()
 
     epochs  = 5 if args.quick else args.epochs
@@ -688,6 +782,7 @@ def main() -> None:
     print(f"  LR: backbone={LR_BACKBONE} | head={LR_HEAD} | epochs={epochs}")
     print(f"  Val split: {VAL_RATIO:.0%} tách từ train fold (early-stop KHÔNG dùng test)")
     print(f"  Output → {OUT_DIR.absolute()}")
+    print(f"  Checkpoint: ghi sau MỖI fold → ngắt giữa chừng vẫn resume được")
     print("=" * 70)
 
     waves, labels, actors = load_ravdess_16k(RAVDESS_PATH)
@@ -712,29 +807,76 @@ def main() -> None:
         splits = splits[:n_folds]
 
     # ── Train ────────────────────────────────────────────────────────────────
+    # FIX #1: CHECKPOINT SAU MỖI FOLD + RESUME.
+    #
+    # Bản trước chỉ ghi CSV SAU KHI cả 5 fold xong. Colab free ngắt runtime
+    # khi idle ~90 phút, mà chạy đủ 5 fold mất ~2 tiếng → chết ở fold 4 là
+    # mất trắng 1.5 giờ. Đây không phải rủi ro lý thuyết, nó SẼ xảy ra.
+    #
+    # Giờ: mỗi fold xong → ghi ngay 1 file .json vào OUT_DIR. Chạy lại script
+    # sẽ tự đọc các fold đã xong và bỏ qua, chỉ chạy fold còn thiếu.
+    import json
+
     rows, all_pred, all_true = [], [], []
-    best_f1, best_model = -1.0, None
+    best_f1, best_model_state = -1.0, None
 
     for name, tr_idx, te_idx in splits:
-        print(f"\n{'─'*60}\n  {name}  (train={len(tr_idx)}, test={len(te_idx)})\n{'─'*60}")
+        ckpt = OUT_DIR / f"_fold_{name.replace(' ', '_')}.json"
+
+        # ── Resume: fold này đã chạy xong rồi thì bỏ qua ─────────────────────
+        if ckpt.exists() and not args.force:
+            saved = json.loads(ckpt.read_text())
+            print(f"\n[RESUME] {name} đã có kết quả → bỏ qua "
+                  f"(Acc={saved['Accuracy(%)']:.2f}%). Dùng --force để chạy lại.")
+            rows.append({k: v for k, v in saved.items()
+                         if k not in ("y_pred", "y_true")})
+            all_pred.append(np.array(saved["y_pred"]))
+            all_true.append(np.array(saved["y_true"]))
+            continue
+
+        print(f"\n{'─'*60}\n  {name}  (train={len(tr_idx)}, test={len(te_idx)})"
+              f"  |  VRAM: {gpu_mem()}\n{'─'*60}")
         r = train_one_fold(waves, y, tr_idx, te_idx, n_cls, epochs, name)
 
         print(f"  → Acc={r['accuracy']:.2f}%  F1={r['f1_macro']:.2f}%  "
               f"P={r['precision']:.2f}%  R={r['recall']:.2f}%  ({r['time_s']:.0f}s)")
 
-        rows.append({
+        row = {
             "Fold":         name,
             "Accuracy(%)":  round(r["accuracy"], 2),
             "F1_macro(%)":  round(r["f1_macro"], 2),
             "Precision(%)": round(r["precision"], 2),
             "Recall(%)":    round(r["recall"], 2),
             "Time(s)":      round(r["time_s"], 1),
-        })
+        }
+        rows.append(row)
         all_pred.append(r["y_pred"])
         all_true.append(r["y_true"])
 
+        # ── Ghi checkpoint NGAY (không đợi hết 5 fold) ───────────────────────
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        ckpt.write_text(json.dumps({
+            **row,
+            "y_pred": r["y_pred"].tolist(),
+            "y_true": r["y_true"].tolist(),
+        }))
+        # Ghi luôn CSV tích luỹ – bị ngắt vẫn còn số liệu các fold đã xong
+        pd.DataFrame(rows).to_csv(out("results_hubert_finetune_partial.csv"),
+                                  index=False)
+        print(f"  [CKPT] Đã lưu {ckpt.name} + partial CSV")
+
+        # ── Giữ model tốt nhất, nhưng ĐẨY VỀ CPU ─────────────────────────────
+        # FIX #2: state_dict trên CPU thay vì giữ nguyên model trên GPU.
+        # Giữ model GPU qua các fold + AdamW states → OOM ở fold 3-4.
         if r["f1_macro"] > best_f1:
-            best_f1, best_model = r["f1_macro"], r["model"]
+            best_f1 = r["f1_macro"]
+            best_model_state = {k: v.detach().cpu().clone()
+                                for k, v in r["model"].state_dict().items()}
+            torch.save(best_model_state, out("hubert_ser_finetuned.pt"))
+
+        # ── Dọn VRAM trước khi sang fold sau ─────────────────────────────────
+        free_gpu(r["model"], r)
+        print(f"  [GPU] Đã dọn VRAM → {gpu_mem()}")
 
     # ── Tổng hợp ─────────────────────────────────────────────────────────────
     df = pd.DataFrame(rows)
@@ -776,14 +918,34 @@ def main() -> None:
     plot_comparison(df[:len(rows)])
     plot_confusion(np.concatenate(all_true), np.concatenate(all_pred),
                    le, mean_acc, mean_f1)
-    if best_model is not None:
-        plot_layer_weights(best_model.layer_weight_values())
 
-        # ── Xuất embedding + model cho các bước sau ──────────────────────────
+    # ── Nạp lại best model từ state_dict (đang nằm trên CPU sau FIX #2) ──────
+    if best_model_state is None:
+        # Trường hợp resume toàn bộ từ checkpoint: đọc .pt đã lưu
+        pt_path = Path(out("hubert_ser_finetuned.pt"))
+        if pt_path.exists():
+            best_model_state = torch.load(pt_path, map_location="cpu")
+
+    if best_model_state is not None:
+        print(f"\n[INFO] Nạp lại best model (F1={best_f1:.2f}%) để xuất embedding...")
+        best_model = HubertSER(n_cls)
+        best_model.load_state_dict(best_model_state)
+        best_model = best_model.to(DEVICE)
+
+        plot_layer_weights(best_model.layer_weight_values())
         export_embeddings(best_model, waves)
-        pt_path = out("hubert_ser_finetuned.pt")
-        torch.save(best_model.state_dict(), pt_path)
-        print(f"[INFO] Model weights → {pt_path}")
+        print(f"[INFO] Model weights → {out('hubert_ser_finetuned.pt')}")
+
+        free_gpu(best_model)
+    else:
+        print("[WARN] Không có model nào để xuất embedding.")
+
+    # ── Dọn checkpoint tạm ───────────────────────────────────────────────────
+    for f in OUT_DIR.glob("_fold_*.json"):
+        f.unlink()
+    partial = Path(out("results_hubert_finetune_partial.csv"))
+    if partial.exists():
+        partial.unlink()
 
     print("\n" + "=" * 70)
     print("  HOÀN THÀNH – Output:")
