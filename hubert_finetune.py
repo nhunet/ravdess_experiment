@@ -376,6 +376,7 @@ class HubertSER(nn.Module):
         config.mask_feature_length = 10
 
         self.hubert = HubertModel.from_pretrained(model_name, config=config)
+        _repair_pos_conv(self.hubert, model_name) 
         hidden = config.hidden_size          # 768
         n_layers = config.num_hidden_layers  # 12 → 13 hidden states (kể cả embed)
 
@@ -755,6 +756,39 @@ def export_embeddings(model: HubertSER, waves: np.ndarray,
     print(f"[INFO] Embedding fine-tuned {E.shape} → {save_path}")
     return E
 
+def _repair_pos_conv(hubert, model_name: str) -> bool:
+    """
+    FIX #8: torch>=2.1 đổi weight_norm → parametrizations, transformers 4.44
+    không remap key → pos_conv_embed bị KHỞI TẠO NGẪU NHIÊN thay vì nạp từ
+    checkpoint. Model vẫn chạy nên rất dễ bỏ sót, nhưng đây là HuBERT hỏng.
+    Hàm này nạp lại weight_g/weight_v thủ công từ checkpoint gốc.
+    """
+    conv = hubert.encoder.pos_conv_embed.conv
+    if not hasattr(conv, "parametrizations"):
+        return False                      # torch cũ, không cần vá
+
+    from huggingface_hub import hf_hub_download
+    sd = None
+    try:
+        from safetensors.torch import load_file
+        sd = load_file(hf_hub_download(model_name, "model.safetensors"))
+    except Exception:
+        sd = torch.load(hf_hub_download(model_name, "pytorch_model.bin"),
+                        map_location="cpu")
+
+    g = sd.get("encoder.pos_conv_embed.conv.weight_g")
+    v = sd.get("encoder.pos_conv_embed.conv.weight_v")
+    if g is None or v is None:
+        print("  [FIX#8] Checkpoint không có weight_g/v → bỏ qua.")
+        return False
+
+    p = conv.parametrizations.weight
+    with torch.no_grad():
+        p.original0.copy_(g.view_as(p.original0))
+        p.original1.copy_(v.view_as(p.original1))
+    print(f"  [FIX#8] Đã nạp lại pos_conv_embed từ checkpoint "
+          f"(g.mean={g.mean():.4f}, v.std={v.std():.4f})")
+    return True
 
 # ============================================================================
 # MAIN
