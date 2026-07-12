@@ -23,6 +23,29 @@ BỐI CẢNH
        (SUPERB, Pepino et al. 2021), thông tin cảm xúc phân bố mạnh ở các
        layer GIỮA, không phải layer cuối.
 
+PHIÊN BẢN v2 – SỬA SAU LẦN CHẠY ĐẦU
+  Lần chạy v1 cho Acc=81.67% / F1=81.08% → ngang bằng frozen baseline
+  (Δ = -0.27%). Chẩn đoán: UNDERFIT, không phải overfit. Bằng chứng:
+  loss chững ở 0.78 và không giảm nữa từ epoch ~12.
+
+  Nguyên nhân: chồng quá nhiều regularization lên model chưa kịp fit —
+  freeze 4 layer + LR backbone 1e-5 + SpecAugment 0.05 + dropout 0.3
+  + label_smoothing 0.1. HuBERT gần như không được điều chỉnh gì.
+
+  Thay đổi v2:
+    • N_FREEZE_LAYERS : 4    → 0      (mở toàn bộ 12 transformer layer)
+    • LR_BACKBONE     : 1e-5 → 3e-5   (chuẩn HuBERT-SER là 1e-5…5e-5)
+    • EPOCHS          : 15   → 30
+    • label_smoothing : 0.1  → 0.05
+    • dropout head    : 0.3  → 0.1
+    • SpecAugment     : 0.05 → 0.03
+    • SỬA RÒ RỈ: early-stop theo val split (15% từ train fold), không còn
+      chọn best epoch trên test fold như v1.
+    • Output ghi vào ./outputs_hubert_ft/ (tránh PermissionError)
+
+  Kỳ vọng: 88–92% (mức literature cho fine-tune HuBERT trên RAVDESS
+  với random split).
+
 BA CẢI TIẾN TRONG FILE NÀY
   (a) Fine-tune có chọn lọc  – mở khóa gradient cho Transformer layers,
                                đóng băng CNN feature encoder (chuẩn của
@@ -66,6 +89,7 @@ YÊU CẦU PHẦN CỨNG
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 import warnings
@@ -84,7 +108,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import (accuracy_score, f1_score, precision_score,
                              recall_score, confusion_matrix)
@@ -98,25 +122,47 @@ warnings.filterwarnings("ignore")
 RAVDESS_PATH  = "./RAVDESS"
 MODEL_NAME    = "facebook/hubert-base-ls960"
 
+# v2: mọi output ghi vào thư mục riêng (tránh PermissionError khi ghi đè
+# file cũ đang bị khoá / thuộc user khác). Đổi bằng env: OUT_DIR=... python ...
+OUT_DIR = Path(os.environ.get("OUT_DIR", "./outputs_hubert_ft"))
+
+
+def out(fname: str) -> str:
+    """Trả về đường dẫn tuyệt đối trong OUT_DIR, tự tạo thư mục nếu chưa có."""
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    return str(OUT_DIR / fname)
+
 TARGET_SR     = 16000        # HuBERT bắt buộc 16kHz
 DURATION      = 3.0          # giây – giống các thực nghiệm trước
 MAX_SAMPLES   = int(TARGET_SR * DURATION)
 
 N_FOLDS       = 5
-EPOCHS        = 15
+EPOCHS        = 30           # v2: 15 → 30 (lần chạy trước loss chững ở 0.78 = underfit)
 BATCH_SIZE    = 8            # HuBERT-base + 3s audio → 8 vừa VRAM T4 (16GB)
 GRAD_ACCUM    = 2            # effective batch = 16
-LR_BACKBONE   = 1e-5         # LR nhỏ cho pretrained weights (tránh phá vỡ)
+LR_BACKBONE   = 3e-5         # v2: 1e-5 → 3e-5 (1e-5 quá rụt rè, backbone gần như đứng yên)
 LR_HEAD       = 1e-3         # LR lớn cho head khởi tạo ngẫu nhiên
 WEIGHT_DECAY  = 0.01
 WARMUP_RATIO  = 0.1
-PATIENCE      = 4
+PATIENCE      = 6            # v2: 4 → 6 (nới vì train dài hơn)
 EMBED_DIM     = 256          # chiều embedding xuất ra cho module recommendation
 RANDOM_SEED   = 42
 
+VAL_RATIO     = 0.15         # v2: tách validation TỪ TRAIN fold để early-stop
+                             #     (trước đây early-stop trên test fold → rò rỉ)
+
+# ── v2: giảm regularization ──────────────────────────────────────────────────
+# Lần chạy v1 chồng quá nhiều regularization lên một model chưa kịp fit:
+#   freeze 4 layer + LR 1e-5 + SpecAugment + dropout 0.3 + label_smoothing 0.1
+# → loss chững ở 0.78, acc 81.67% (ngang frozen baseline). Đây là UNDERFIT.
+LABEL_SMOOTH  = 0.05         # v2: 0.1 → 0.05
+DROPOUT_HEAD  = 0.1          # v2: 0.3 → 0.1
+SPEC_AUG_PROB = 0.03         # v2: 0.05 → 0.03 (giữ nhẹ để vẫn chống overfit)
+
 # Đóng băng N transformer layer đầu tiên (0 = fine-tune toàn bộ 12 layer).
-# Với dataset nhỏ như RAVDESS, đóng băng 4-6 layer đầu thường ổn định hơn.
-N_FREEZE_LAYERS = 4
+# v2: 4 → 0. Với LR nhỏ + SpecAugment đã đủ chống overfit; đóng băng thêm
+# 4 layer khiến model không học được gì mới cho task SER.
+N_FREEZE_LAYERS = 0
 
 EMOTIONS = {
     1: "neutral", 2: "calm",    3: "happy",    4: "sad",
@@ -264,9 +310,9 @@ class HubertSER(nn.Module):
         config.output_hidden_states = True
         # SpecAugment – regularization cực quan trọng với dataset 1.440 mẫu
         config.apply_spec_augment = True
-        config.mask_time_prob     = 0.05
+        config.mask_time_prob     = SPEC_AUG_PROB
         config.mask_time_length   = 10
-        config.mask_feature_prob  = 0.05
+        config.mask_feature_prob  = SPEC_AUG_PROB
         config.mask_feature_length = 10
 
         self.hubert = HubertModel.from_pretrained(model_name, config=config)
@@ -298,7 +344,7 @@ class HubertSER(nn.Module):
         self.embed_fc = nn.Sequential(
             nn.Linear(hidden, EMBED_DIM),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(DROPOUT_HEAD),
         )
         self.classifier = nn.Linear(EMBED_DIM, n_classes)
 
@@ -374,15 +420,40 @@ def train_one_fold(waves: np.ndarray, y: np.ndarray,
                    tr_idx: np.ndarray, te_idx: np.ndarray,
                    n_classes: int, epochs: int,
                    fold_name: str = "") -> dict:
-    """Huấn luyện 1 fold, trả về metrics + model đã train."""
-    tr_dl = DataLoader(RavdessDataset(waves[tr_idx], y[tr_idx]),
+    """
+    Huấn luyện 1 fold, trả về metrics + model đã train.
+
+    v2 – SỬA RÒ RỈ DỮ LIỆU:
+      Bản v1 chọn best epoch theo F1 đo trên chính TEST fold → test set đã
+      tham gia vào quyết định model → con số báo cáo bị lạc quan. Đây là lỗi
+      phương pháp, thầy phản biện sẽ bắt ngay.
+
+      Bản v2 tách VAL (15%) từ TRAIN fold:
+        train fold ─┬─ 85% → cập nhật trọng số
+                    └─ 15% → early-stopping + chọn best checkpoint
+        test  fold ───────→ CHỈ đo 1 lần cuối, không hề can thiệp vào training
+    """
+    # ── Tách validation từ train fold (stratified) ──────────────────────────
+    y_tr_full = y[tr_idx]
+    sub_tr, sub_val = train_test_split(
+        np.arange(len(tr_idx)),
+        test_size=VAL_RATIO,
+        stratify=y_tr_full,
+        random_state=RANDOM_SEED,
+    )
+    real_tr = tr_idx[sub_tr]
+    real_val = tr_idx[sub_val]
+
+    tr_dl = DataLoader(RavdessDataset(waves[real_tr], y[real_tr]),
                        batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+    val_dl = DataLoader(RavdessDataset(waves[real_val], y[real_val]),
+                        batch_size=BATCH_SIZE)
     te_dl = DataLoader(RavdessDataset(waves[te_idx], y[te_idx]),
                        batch_size=BATCH_SIZE)
 
     model  = HubertSER(n_classes).to(DEVICE)
     opt    = _make_optimizer(model)
-    lossfn = nn.CrossEntropyLoss(label_smoothing=0.1)
+    lossfn = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH)
     scaler = torch.amp.GradScaler(enabled=(DEVICE.type == "cuda"))
 
     total_steps = max(1, (len(tr_dl) // GRAD_ACCUM) * epochs)
@@ -416,16 +487,17 @@ def train_one_fold(waves: np.ndarray, y: np.ndarray,
                 if sched.last_epoch < total_steps - 1:
                     sched.step()
 
-        y_pred, y_true = _evaluate(model, te_dl)
-        acc = accuracy_score(y_true, y_pred)
-        f1  = f1_score(y_true, y_pred, average="macro", zero_division=0)
+        # v2: early-stop theo VALIDATION (không đụng vào test fold)
+        v_pred, v_true = _evaluate(model, val_dl)
+        val_acc = accuracy_score(v_true, v_pred)
+        val_f1  = f1_score(v_true, v_pred, average="macro", zero_division=0)
 
         print(f"    [{fold_name}] Epoch {ep+1:2d}/{epochs}  "
               f"loss={run_loss/max(1,len(tr_dl)):.4f}  "
-              f"acc={acc*100:5.2f}%  f1={f1*100:5.2f}%")
+              f"val_acc={val_acc*100:5.2f}%  val_f1={val_f1*100:5.2f}%")
 
-        if f1 > best_f1:
-            best_f1 = f1
+        if val_f1 > best_f1:
+            best_f1 = val_f1
             best_state = {k: v.detach().cpu().clone()
                           for k, v in model.state_dict().items()}
             no_improve = 0
@@ -438,6 +510,7 @@ def train_one_fold(waves: np.ndarray, y: np.ndarray,
     if best_state is not None:
         model.load_state_dict(best_state)
 
+    # ── Đo trên TEST fold – DUY NHẤT 1 lần, sau khi model đã chốt ────────────
     y_pred, y_true = _evaluate(model, te_dl)
     return {
         "model":     model,
@@ -456,8 +529,9 @@ def train_one_fold(waves: np.ndarray, y: np.ndarray,
 # ============================================================================
 
 def plot_comparison(df: pd.DataFrame,
-                    save_path: str = "results_hubert_finetune.png") -> None:
+                    save_path: str | None = None) -> None:
     """So sánh Fine-tuned vs các baseline đã có."""
+    save_path = save_path or out("results_hubert_finetune.png")
     ft_acc = df["Accuracy(%)"].mean()
     ft_f1  = df["F1_macro(%)"].mean()
     ft_std = df["Accuracy(%)"].std()
@@ -506,12 +580,13 @@ def plot_comparison(df: pd.DataFrame,
 
 
 def plot_layer_weights(weights: np.ndarray,
-                       save_path: str = "hubert_ft_layer_weights.png") -> None:
+                       save_path: str | None = None) -> None:
     """
     Vẽ trọng số α học được cho từng layer.
     Đây là insight rất đáng đưa vào báo cáo: chứng minh bằng số liệu rằng
     thông tin cảm xúc KHÔNG nằm ở layer cuối như code frozen cũ giả định.
     """
+    save_path = save_path or out("hubert_ft_layer_weights.png")
     if weights.size == 0:
         return
     fig, ax = plt.subplots(figsize=(11, 5))
@@ -537,7 +612,8 @@ def plot_layer_weights(weights: np.ndarray,
 
 def plot_confusion(y_true: np.ndarray, y_pred: np.ndarray,
                    le: LabelEncoder, acc: float, f1: float,
-                   save_path: str = "confusion_hubert_finetune.png") -> None:
+                   save_path: str | None = None) -> None:
+    save_path = save_path or out("confusion_hubert_finetune.png")
     cm = confusion_matrix(y_true, y_pred).astype(float)
     cm_pct = cm / cm.sum(axis=1, keepdims=True) * 100
 
@@ -562,7 +638,7 @@ def plot_confusion(y_true: np.ndarray, y_pred: np.ndarray,
 
 @torch.no_grad()
 def export_embeddings(model: HubertSER, waves: np.ndarray,
-                      save_path: str = "embeddings_hubert_finetuned.npy") -> np.ndarray:
+                      save_path: str | None = None) -> np.ndarray:
     """
     Trích embedding 256-d từ model đã fine-tune cho TOÀN BỘ dataset.
 
@@ -571,6 +647,7 @@ def export_embeddings(model: HubertSER, waves: np.ndarray,
                                để xem AttGate-MLP có vượt 87.15% không
       • llm_reranker.py      – vector cảm xúc thật đưa vào module gợi ý
     """
+    save_path = save_path or out("embeddings_hubert_finetuned.npy")
     model.eval()
     dl = DataLoader(RavdessDataset(waves, np.zeros(len(waves), dtype=np.int64)),
                     batch_size=BATCH_SIZE)
@@ -608,6 +685,9 @@ def main() -> None:
     print(f"  Device: {DEVICE}  |  Model: {MODEL_NAME}")
     print(f"  Protocol: {'Speaker-independent' if args.speaker_split else f'{n_folds}-fold Stratified CV'}")
     print(f"  Freeze: CNN encoder + {N_FREEZE_LAYERS} transformer layer đầu")
+    print(f"  LR: backbone={LR_BACKBONE} | head={LR_HEAD} | epochs={epochs}")
+    print(f"  Val split: {VAL_RATIO:.0%} tách từ train fold (early-stop KHÔNG dùng test)")
+    print(f"  Output → {OUT_DIR.absolute()}")
     print("=" * 70)
 
     waves, labels, actors = load_ravdess_16k(RAVDESS_PATH)
@@ -688,8 +768,9 @@ def main() -> None:
         print("    → Fine-tune đơn lẻ CHƯA vượt fusion. Bước tiếp theo: đưa "
               "embedding fine-tuned vào fusion_experiment.py.")
 
-    df.to_csv("results_hubert_finetune.csv", index=False)
-    print("\n[INFO] Đã lưu: results_hubert_finetune.csv")
+    csv_path = out("results_hubert_finetune.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"\n[INFO] Đã lưu: {csv_path}")
 
     # ── Visualization ────────────────────────────────────────────────────────
     plot_comparison(df[:len(rows)])
@@ -700,8 +781,9 @@ def main() -> None:
 
         # ── Xuất embedding + model cho các bước sau ──────────────────────────
         export_embeddings(best_model, waves)
-        torch.save(best_model.state_dict(), "hubert_ser_finetuned.pt")
-        print("[INFO] Model weights → hubert_ser_finetuned.pt")
+        pt_path = out("hubert_ser_finetuned.pt")
+        torch.save(best_model.state_dict(), pt_path)
+        print(f"[INFO] Model weights → {pt_path}")
 
     print("\n" + "=" * 70)
     print("  HOÀN THÀNH – Output:")
