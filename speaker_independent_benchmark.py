@@ -310,6 +310,19 @@ def make_val_split(tr: np.ndarray, y: np.ndarray, actors: np.ndarray,
 # PHẦN 3: BA MÔ HÌNH
 # ============================================================================
 
+def _metrics(y_true, y_pred, elapsed) -> dict:
+    """Tính đủ 4 metric + thời gian, dùng chung cho cả 3 model."""
+    return {
+        "Accuracy(%)":  accuracy_score(y_true, y_pred) * 100,
+        "F1_macro(%)":  f1_score(y_true, y_pred, average="macro", zero_division=0) * 100,
+        "Precision(%)": precision_score(y_true, y_pred, average="macro", zero_division=0) * 100,
+        "Recall(%)":    recall_score(y_true, y_pred, average="macro", zero_division=0) * 100,
+        "Time(s)":      elapsed,
+        "y_pred":       y_pred,
+        "y_true":       y_true,
+    }
+
+
 def run_A_frozen_svm(X_emb, y, tr, te) -> dict:
     """A. HuBERT frozen + SVM (RBF) – baseline gốc."""
     clf = Pipeline([
