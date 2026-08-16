@@ -89,6 +89,21 @@ CÁCH CHẠY
   python speaker_adversarial.py --quick              # 2 fold, 10 ep (~25 phút)
   python speaker_adversarial.py                      # đủ 4 cấu hình (~3 giờ)
   python speaker_adversarial.py --configs base aug   # chỉ 2 cấu hình
+
+CHECKPOINT BỀN VỮNG (không cần merge thủ công)
+  Mỗi (config × fold) được lưu vĩnh viễn dưới dạng _adv_<config>_<G>.json
+  trong OUT_DIR. Chạy từng cấu hình riêng biệt LUÔN cho kết quả tổng hợp
+  đầy đủ vì script quét lại toàn bộ checkpoint mỗi lần chạy. Ví dụ:
+
+    # ngày 1
+    python speaker_adversarial.py --configs base aug
+    # ngày 2 – results_adversarial.csv sẽ chứa cả 3 config, không phải chỉ grl
+    python speaker_adversarial.py --configs grl
+    # ngày 3 – results_adversarial.csv sẽ chứa đủ 4 config
+    python speaker_adversarial.py --configs aug+grl
+
+  --force: chỉ xoá checkpoint của các config được chỉ định trong lần chạy đó,
+           KHÔNG đụng các config khác đã có trên disk.
 =============================================================================
 """
 
@@ -648,21 +663,24 @@ def main() -> None:
     actors = np.array(actors)
 
     splits = losgo_splits(actors)[:n_grp]
-    rows = []
-    preds = {c: {"true": [], "pred": []} for c in args.configs}
+
+    # ── Nếu --force: chỉ xoá checkpoint của các config được yêu cầu train lại ──
+    # (KHÔNG đụng đến checkpoint của các config KHÁC — giữ nguyên dữ liệu cũ.)
+    if args.force:
+        for cfg_name in args.configs:
+            for f in OUT_DIR.glob(f"_adv_{cfg_name}_*.json"):
+                f.unlink()
+                print(f"  [FORCE] Đã xoá checkpoint cũ: {f.name}")
 
     for name, tr, te, g in splits:
         print(f"\n{'─'*68}\n  {name}  |  VRAM: {gpu_mem()}\n{'─'*68}")
 
         for cfg_name in args.configs:
             ck = OUT_DIR / f"_adv_{cfg_name}_{name.split()[0]}.json"
-            if ck.exists() and not args.force:
+            if ck.exists():
                 s = json.loads(ck.read_text())
                 print(f"  [RESUME] {cfg_name} @ {name} → bỏ qua "
                       f"({s['row']['Accuracy(%)']:.2f}%)")
-                rows.append(s["row"])
-                preds[cfg_name]["true"].extend(s["y_true"])
-                preds[cfg_name]["pred"].extend(s["y_pred"])
                 continue
 
             r = train_config(waves, y, actors, tr, te, n_cls,
@@ -685,21 +703,38 @@ def main() -> None:
             print(f"  [{cfg_name:8s}] Acc={r['Accuracy(%)']:.2f}%  "
                   f"F1={r['F1_macro(%)']:.2f}%  ({r['Time(s)']:.0f}s)")
 
-            rows.append(row)
-            preds[cfg_name]["true"].extend(r["y_true"].tolist())
-            preds[cfg_name]["pred"].extend(r["y_pred"].tolist())
-
             OUT_DIR.mkdir(parents=True, exist_ok=True)
             ck.write_text(json.dumps({
                 "row": row,
                 "y_true": r["y_true"].tolist(),
                 "y_pred": r["y_pred"].tolist(),
             }))
-            pd.DataFrame(rows).to_csv(out("results_partial.csv"), index=False)
 
-    # ── Tổng hợp ─────────────────────────────────────────────────────────────
+    # ── TỔNG HỢP: quét TẤT CẢ checkpoint _adv_*.json (mọi config từng chạy) ──
+    # Đây là chỗ then chốt: không dùng biến `rows` local nữa. Mỗi lần chạy,
+    # script đọc lại toàn bộ dữ liệu bền vững trên disk, nên bảng tổng hợp và
+    # thống kê LUÔN đầy đủ 4 cấu hình dù bạn chạy từng cấu hình riêng biệt.
+    rows = []
+    preds: dict[str, dict[str, list]] = {}
+    all_ckpts = sorted(OUT_DIR.glob("_adv_*.json"))
+    for ck in all_ckpts:
+        s = json.loads(ck.read_text())
+        cfg = s["row"]["Config"]
+        rows.append(s["row"])
+        preds.setdefault(cfg, {"true": [], "pred": []})
+        preds[cfg]["true"].extend(s["y_true"])
+        preds[cfg]["pred"].extend(s["y_pred"])
+
     df = pd.DataFrame(rows)
+    if df.empty:
+        print("\n[WARN] Chưa có checkpoint nào — bỏ qua bước tổng hợp.")
+        return
+
+    df = df.sort_values(["Config", "Fold"]).reset_index(drop=True)
     df.to_csv(out("results_adversarial.csv"), index=False)
+    print(f"\n[INFO] Đã gộp {df['Config'].nunique()} cấu hình × "
+          f"{df.groupby('Config').size().min()}-{df.groupby('Config').size().max()} fold "
+          f"từ {len(all_ckpts)} checkpoint bền vững.")
 
     summ = df.groupby("Config").agg(
         Acc=("Accuracy(%)", "mean"), Std=("Accuracy(%)", "std"),
@@ -764,7 +799,8 @@ def main() -> None:
     print("=" * 74)
 
     emo_rows, conf_rows = [], []
-    for cfg in args.configs:
+    all_cfgs_on_disk = [c for c in CONFIGS if c in preds]
+    for cfg in all_cfgs_on_disk:
         yt = np.array(preds[cfg]["true"])
         yp = np.array(preds[cfg]["pred"])
         if len(yt) == 0:
@@ -791,9 +827,12 @@ def main() -> None:
         pd.DataFrame(conf_rows).to_csv(out("confusion_pairs.csv"), index=False)
 
     # ── Kiểm định thống kê ───────────────────────────────────────────────────
-    if df["Fold"].nunique() >= 3 and len(args.configs) > 1:
+    # Chạy trên TOÀN BỘ config có trên disk, không chỉ args.configs.
+    n_cfgs_on_disk = df["Config"].nunique()
+    if df["Fold"].nunique() >= 3 and n_cfgs_on_disk > 1:
         print("\n" + "=" * 74)
-        print(f"  KIỂM ĐỊNH THỐNG KÊ (paired, n={df['Fold'].nunique()} fold)")
+        print(f"  KIỂM ĐỊNH THỐNG KÊ (paired, n={df['Fold'].nunique()} fold, "
+              f"{n_cfgs_on_disk} cấu hình)")
         print("=" * 74)
         try:
             d2 = df.rename(columns={"Config": "Model"})
@@ -807,20 +846,20 @@ def main() -> None:
 
     plot_ablation(summ)
 
-    for f in OUT_DIR.glob("_adv_*.json"):
-        f.unlink()
-    p = Path(out("results_partial.csv"))
-    if p.exists():
-        p.unlink()
+    # KHÔNG xoá _adv_*.json — đây là nguồn dữ liệu bền vững để tổng hợp các lần
+    # chạy riêng biệt. Nếu muốn train lại từ đầu, dùng --force (chỉ xoá checkpoint
+    # của các config bạn truyền qua --configs).
 
     print("\n" + "=" * 74)
     print("  HOÀN THÀNH – Output:")
-    print(f"  • {out('results_adversarial.csv')}          (ablation)")
+    print(f"  • {out('results_adversarial.csv')}          (ablation, "
+          f"{n_cfgs_on_disk} cấu hình)")
     print(f"  • {out('per_emotion_results.csv')}       (per-emotion)")
     print(f"  • {out('confusion_pairs.csv')}          (cặp nhầm lẫn)")
     print(f"  • {out('ablation_study.png')}")
     print(f"  • {out('per_emotion_f1.png')}")
     print(f"  • confusion_<config>.png")
+    print(f"  • {len(all_ckpts)} file _adv_*.json (checkpoint bền vững – GIỮ LẠI)")
     print("=" * 74 + "\n")
 
 
