@@ -544,8 +544,19 @@ HOP_SEQ     = 512   # hop → T ≈ 130 frames với DURATION=3s @ 22.05 kHz
 BATCH_MFCC  = 32    # MFCC nhẹ hơn waveform nhiều, tăng batch lên
 EPOCHS_MFCC = 60    # tăng epochs vì mô hình nhỏ, hội tụ chậm hơn
 LR_MFCC     = 1e-3  # LR chuẩn cho model random-init
-WD_MFCC     = 1e-4
+WD_MFCC     = 3e-4  # AdamW WD vừa (giữa 1e-4 và 1e-3 — chống overfit CRNN
+                    # ~1M params, không quá aggressive gây chậm hội tụ)
 PATIENCE_MFCC = 10  # nới patience vì val có thể dao động
+
+# SpecAugment params (Park et al. 2019) — chỉ áp cho train của D/E/F.
+# LOSGO cần speaker invariance: time-mask giúp model bớt phụ thuộc timing
+# tuyệt đối (speaker khác thường nói nhanh/chậm khác), freq-mask giúp bớt
+# phụ thuộc formant cụ thể (speaker khác có timbre khác). Đây là hai
+# nguồn biến thiên chính giữa các diễn viên trên RAVDESS.
+SPECAUG_N_TIME_MASKS = 2   # ~15% của T=130 mỗi mask, tổng có thể tới 30%
+SPECAUG_TIME_WIDTH   = 20
+SPECAUG_N_FREQ_MASKS = 2   # ~20% của F=40 mỗi mask, tổng có thể tới 40%
+SPECAUG_FREQ_WIDTH   = 8
 
 
 def extract_mfcc_seq(waves22k: np.ndarray) -> np.ndarray:
@@ -576,16 +587,63 @@ def extract_mfcc_seq(waves22k: np.ndarray) -> np.ndarray:
     return X
 
 
+def _spec_augment(x: np.ndarray, rng: np.random.RandomState) -> np.ndarray:
+    """
+    SpecAugment (Park et al. 2019) đơn giản: time + frequency masking.
+
+    Input x: (F, T) MFCC đã z-normalized. Mask fill = 0 (mean của tensor
+    z-normalized ≈ 0, không gây spike distribution).
+    """
+    F, T = x.shape
+    x = x.copy()
+    # time masks
+    for _ in range(SPECAUG_N_TIME_MASKS):
+        w = int(rng.uniform(0, SPECAUG_TIME_WIDTH + 1))
+        if w == 0 or w >= T:
+            continue
+        t0 = int(rng.uniform(0, T - w))
+        x[:, t0:t0 + w] = 0.0
+    # freq masks
+    for _ in range(SPECAUG_N_FREQ_MASKS):
+        w = int(rng.uniform(0, SPECAUG_FREQ_WIDTH + 1))
+        if w == 0 or w >= F:
+            continue
+        f0 = int(rng.uniform(0, F - w))
+        x[f0:f0 + w, :] = 0.0
+    return x
+
+
 class _MFCCDataset(torch.utils.data.Dataset):
-    """(N, F, T) → tensor, không augment (dùng chung cho D/E/F)."""
-    def __init__(self, X: np.ndarray, y: np.ndarray) -> None:
+    """
+    (N, F, T) → tensor. Tuỳ chọn SpecAugment trên train (D/E/F).
+    Val/test luôn KHÔNG augment — tuân đúng nguyên tắc của AugmentedDataset
+    ở speaker_adversarial.py.
+
+    Worker-safe RNG: seed từ (worker_info.seed + index) để mỗi worker + mỗi
+    call cho chuỗi ngẫu nhiên độc lập, tránh 2 worker sinh cùng mask (bug
+    đã gặp ở AugmentedDataset khi num_workers > 0).
+    """
+    def __init__(self, X: np.ndarray, y: np.ndarray, augment: bool = False) -> None:
         self.X = X
         self.y = y
+        self.augment = augment
     def __len__(self) -> int:
         return len(self.y)
     def __getitem__(self, i):
-        return (torch.from_numpy(self.X[i]),
+        x = self.X[i]
+        if self.augment:
+            info = torch.utils.data.get_worker_info()
+            worker_seed = info.seed if info is not None else 0
+            rng = np.random.RandomState((worker_seed + i) % (2**32 - 1))
+            x = _spec_augment(x, rng)
+        return (torch.from_numpy(x),
                 torch.tensor(self.y[i], dtype=torch.long))
+
+
+def _mfcc_worker_init(worker_id: int) -> None:
+    """Đảm bảo mỗi DataLoader worker có seed khác — cần cho SpecAugment."""
+    seed = (torch.initial_seed() + worker_id) % (2**32 - 1)
+    np.random.seed(seed)
 
 
 # ── D. CNN2D on MFCC spectrogram ────────────────────────────────────────────
@@ -655,6 +713,11 @@ class _CRNN_SER(nn.Module):
     """
     def __init__(self, n_classes: int) -> None:
         super().__init__()
+        # 3 lần MaxPool((2, 1)) trên trục freq → F giảm đúng 8 lần.
+        # LSTM input dim = 128 · (F // 8). Nếu N_MFCC_SEQ không chia hết 8,
+        # tính toán bị sai → LSTM shape mismatch runtime.
+        assert N_MFCC_SEQ % 8 == 0, (
+            f"N_MFCC_SEQ={N_MFCC_SEQ} phải chia hết cho 8 (3 lần MaxPool freq)")
         self.conv = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32), nn.ReLU(inplace=True),
@@ -692,8 +755,10 @@ def _train_mfcc_model(model: nn.Module, X: np.ndarray, y: np.ndarray,
 
     kw = dict(pin_memory=(DEVICE.type == "cuda"),
               num_workers=2 if DEVICE.type == "cuda" else 0)
-    tr_dl = DataLoader(_MFCCDataset(X[real_tr], y[real_tr]),
-                       batch_size=BATCH_MFCC, shuffle=True, drop_last=True, **kw)
+    # Chỉ train dùng SpecAugment; val/test KHÔNG augment (đúng nguyên tắc)
+    tr_dl = DataLoader(_MFCCDataset(X[real_tr], y[real_tr], augment=True),
+                       batch_size=BATCH_MFCC, shuffle=True, drop_last=True,
+                       worker_init_fn=_mfcc_worker_init, **kw)
     val_dl = DataLoader(_MFCCDataset(X[real_val], y[real_val]),
                         batch_size=BATCH_MFCC, **kw)
     te_dl = DataLoader(_MFCCDataset(X[te], y[te]),
@@ -772,9 +837,17 @@ class _Wav2Vec2SER(nn.Module):
     classifier), chỉ đổi backbone → Wav2Vec2-base. Cùng head → so công bằng
     "HuBERT vs Wav2Vec2 as pretrained backbone".
 
-    Không cần _repair_pos_conv — bug weight_norm mà FIX #8 vá chỉ ảnh hưởng
-    HuBERT trong transformers 4.51; Wav2Vec2 dùng parametrization khác và
-    HuggingFace ánh xạ đúng.
+    ⚠️ Wav2Vec2Positional_ConvEmbedding CÓ CÙNG bug weight_norm như HuBERT.
+    Từ transformers 4.51, cả hai model dùng `weight_norm(self.conv, dim=2)`;
+    PyTorch ≥ 2.1 lưu tham số ở `parametrizations.weight.original0/1`
+    trong khi checkpoint gốc có `weight_g/weight_v` → pos_conv_embed bị
+    khởi tạo NGẪU NHIÊN nếu không remap. Bug này được xác nhận trên cả hai
+    (HF issue #27605, #33995). Không vá → Wav2Vec2 bị hỏng một phần y hệt
+    HuBERT trước khi vá → so C vs G mất công bằng.
+
+    _repair_pos_conv của hubert_finetune truy cập `.encoder.pos_conv_embed
+    .conv` — Wav2Vec2Model có ĐÚNG cùng attribute path (verified trên
+    transformers v4.51.3), nên tái sử dụng trực tiếp được.
     """
     HIDDEN = 768
     EMBED_DIM = 256
@@ -786,6 +859,8 @@ class _Wav2Vec2SER(nn.Module):
         cfg = Wav2Vec2Config.from_pretrained(model_name)
         cfg.output_hidden_states = True
         self.wav2vec = Wav2Vec2Model.from_pretrained(model_name, config=cfg)
+        # ⚠️ VÁ pos_conv_embed y hệt HuBERT — xem docstring class trên
+        _repair_pos_conv(self.wav2vec, model_name)
         # Đóng băng CNN feature extractor (chuẩn khi fine-tune SSL cho SER)
         try:
             self.wav2vec.feature_extractor._freeze_parameters()
