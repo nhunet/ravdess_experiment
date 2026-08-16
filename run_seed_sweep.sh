@@ -56,6 +56,11 @@ run_one_seed() {
 
     echo ""
     echo "✓ SEED $SEED HOÀN THÀNH — checkpoint tại $OUT_DIR"
+    echo ""
+    echo "  Gộp kết quả (chạy được ngay cả khi mới có 1 seed):"
+    echo "    python merge_seeds.py --base-dir $BASE_OUT_DIR"
+    echo "  → bảng ablation, kiểm định ghép cặp trên (Seed, Fold), per-emotion,"
+    echo "    confusion matrix, và cảnh báo nếu còn thiếu fold/config nào."
 }
 
 case "${1:-help}" in
@@ -68,7 +73,7 @@ case "${1:-help}" in
         done
         echo ""
         echo "############################################################"
-        echo "  ALL 3 SEEDS DONE — gộp bằng merge_seeds.py để có stats"
+        echo "  ALL 3 SEEDS DONE"
         echo "############################################################"
         ;;
     *)

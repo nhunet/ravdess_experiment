@@ -147,6 +147,17 @@ FIVEFOLD = {
     "C. HuBERT fine-tuned":   89.58,
 }
 
+# Mã model (dùng ở --models) → tên đầy đủ trong bảng kết quả và tên checkpoint.
+MODEL_NAMES = {
+    "A": "A. HuBERT frozen + SVM",
+    "B": "B. AttGate Fusion",
+    "C": "C. HuBERT fine-tuned",
+}
+
+# Thứ tự cảm xúc để vẽ (LabelEncoder sắp xếp theo alphabet, không theo thứ tự này)
+EMO_ORDER = ["neutral", "calm", "happy", "sad",
+             "angry", "fearful", "disgust", "surprised"]
+
 FUSION_EPOCHS = 60
 FUSION_BATCH  = 32
 
@@ -269,7 +280,8 @@ def extract_hubert_frozen(waves: np.ndarray) -> np.ndarray:
 
 
 def make_val_split(tr: np.ndarray, y: np.ndarray, actors: np.ndarray,
-                   speaker_disjoint: bool) -> tuple[np.ndarray, np.ndarray]:
+                   speaker_disjoint: bool,
+                   seed: int | None = None) -> tuple[np.ndarray, np.ndarray]:
     """
     VÁ LỖI #3: validation cũng phải SPEAKER-DISJOINT.
 
@@ -281,16 +293,29 @@ def make_val_split(tr: np.ndarray, y: np.ndarray, actors: np.ndarray,
     speaker_disjoint=True : lấy 4 actor trong train fold ra làm val
                             → early-stop dựa trên giọng LẠ, khớp mục tiêu.
     speaker_disjoint=False: val cùng actor (giữ để ĐO khoảng cách leakage).
+
+    ── VÁ LỖI MULTI-SEED (quan trọng cho sweep 3 seed) ──────────────────────
+    Trước đây hàm này luôn dùng RANDOM_SEED cố định (=42) lấy từ
+    hubert_finetune, KHÔNG đọc biến môi trường SEED. Hệ quả: chạy sweep
+    SEED=42/43/44 thì cả 3 seed đều chọn ĐÚNG 4 diễn viên validation giống
+    nhau — variance đo được vì thế hẹp hơn thực tế, vì một nguồn biến thiên
+    lớn (chọn ai làm val) bị đóng băng.
+
+    Giờ nhận tham số `seed`. Bỏ trống → giữ nguyên hành vi cũ (RANDOM_SEED),
+    nên MỌI kết quả đã chạy với seed 42 vẫn tái lập được y hệt; chỉ seed
+    43/44 mới nhận split khác.
     """
+    seed = RANDOM_SEED if seed is None else int(seed)
+
     if not speaker_disjoint:
         sub_tr, sub_val = train_test_split(
             np.arange(len(tr)), test_size=VAL_RATIO,
-            stratify=y[tr], random_state=RANDOM_SEED)
+            stratify=y[tr], random_state=seed)
         return tr[sub_tr], tr[sub_val]
 
     # Lấy 4 actor cuối trong train fold làm val (2 nam + 2 nữ nếu liên tiếp)
     tr_actors = np.unique(actors[tr])
-    rng = np.random.RandomState(RANDOM_SEED)
+    rng = np.random.RandomState(seed)
     val_actors = rng.choice(tr_actors, size=4, replace=False)
 
     mask_val = np.isin(actors[tr], val_actors)
@@ -546,6 +571,81 @@ def paired_tests(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def per_emotion_analysis(preds: dict, le: LabelEncoder) -> None:
+    """
+    Per-emotion + confusion matrix cho từng model, gộp toàn bộ fold.
+
+    Chỉ chạy được từ khi checkpoint lưu y_true/y_pred (xem phần vá trong
+    main()). Trước đây `_row()` vứt predictions nên muốn có bảng per-emotion
+    là phải train lại toàn bộ 6 fold — đúng thứ báo cáo/bài báo đang thiếu.
+    """
+    if not preds:
+        print("\n[INFO] Chưa có checkpoint nào kèm predictions "
+              "(checkpoint cũ không lưu) → bỏ qua per-emotion.\n"
+              "       Chạy lại với --force để sinh dữ liệu này.")
+        return
+
+    from sklearn.metrics import classification_report
+
+    print("\n" + "=" * 72)
+    print("  PHÂN TÍCH PER-EMOTION (gộp mọi fold)")
+    print("=" * 72)
+
+    emo_rows, pair_rows = [], []
+    for model_name, d in preds.items():
+        yt, yp = np.array(d["true"]), np.array(d["pred"])
+        acc = accuracy_score(yt, yp) * 100
+        rep = classification_report(yt, yp, target_names=le.classes_,
+                                    output_dict=True, zero_division=0)
+        for emo in le.classes_:
+            s = rep[emo]
+            emo_rows.append({
+                "Model": model_name, "Emotion": emo,
+                "Precision(%)": round(s["precision"] * 100, 2),
+                "Recall(%)":    round(s["recall"] * 100, 2),
+                "F1(%)":        round(s["f1-score"] * 100, 2),
+                "Support":      int(s["support"]),
+            })
+
+        cm = confusion_matrix(yt, yp).astype(float)
+        cm_pct = cm / np.clip(cm.sum(axis=1, keepdims=True), 1e-9, None) * 100
+        cls = list(le.classes_)
+
+        fig, ax = plt.subplots(figsize=(9, 7))
+        sns.heatmap(cm_pct, annot=True, fmt=".1f", cmap="Blues",
+                    xticklabels=cls, yticklabels=cls, linewidths=0.5, ax=ax,
+                    cbar_kws={"label": "Tỷ lệ (%)"})
+        ax.set_title(f"Confusion Matrix – {model_name}\n"
+                     f"LOSGO 6-fold gộp, Acc={acc:.2f}%", fontweight="bold")
+        ax.set_xlabel("Dự đoán"); ax.set_ylabel("Thực tế")
+        plt.tight_layout()
+        fname = f"confusion_{model_name.split('.')[0].strip()}.png"
+        plt.savefig(out(fname), dpi=150, bbox_inches="tight")
+        plt.close()
+
+        pairs = sorted(((cls[i], cls[j], cm_pct[i, j])
+                        for i in range(len(cls)) for j in range(len(cls))
+                        if i != j), key=lambda x: -x[2])
+        print(f"\n  [{model_name}]  Acc={acc:.2f}%  → {fname}")
+        print("    3 cặp nhầm lẫn nặng nhất:")
+        for a, b, v in pairs[:3]:
+            print(f"      {a:10s} → bị đoán thành {b:10s}: {v:5.1f}%")
+
+        row = {"Model": model_name}
+        if "neutral" in cls and "calm" in cls:
+            i_n, i_c = cls.index("neutral"), cls.index("calm")
+            row["neutral→calm"] = round(float(cm_pct[i_n, i_c]), 2)
+            row["calm→neutral"] = round(float(cm_pct[i_c, i_n]), 2)
+            print(f"      ── Cặp kinh điển neutral↔calm: "
+                  f"{row['neutral→calm']:.1f}% / {row['calm→neutral']:.1f}%")
+        pair_rows.append(row)
+
+    df_emo = pd.DataFrame(emo_rows)
+    df_emo.to_csv(out("per_emotion_speaker_independent.csv"), index=False)
+    pd.DataFrame(pair_rows).to_csv(out("confusion_pairs_bench.csv"), index=False)
+    print(f"\n  → {out('per_emotion_speaker_independent.csv')}")
+
+
 def plot_comparison(df: pd.DataFrame) -> None:
     """Biểu đồ chính: 5-fold (có leakage) vs LOSGO (không leakage)."""
     summ = df.groupby("Model").agg(
@@ -652,47 +752,97 @@ def main() -> None:
         X_hc = extract_mfcc_hc(waves22)
         del waves22
 
-    rows = []
+    # ── VÁ LỖI CHECKPOINT (2 lỗi thật, đều làm mất dữ liệu) ──────────────────
+    # LỖI 1: checkpoint cũ khoá theo FOLD (_bench_G1.json), không theo MODEL.
+    #        Chạy `--models A` trước rồi `--models C` sau → vòng resume thấy
+    #        _bench_G1.json đã tồn tại nên BỎ QUA cả fold, model C không bao
+    #        giờ được chạy, và bảng kết quả chỉ có mỗi model A.
+    # LỖI 2: cuối main() có vòng xoá sạch _bench_*.json sau khi chạy xong →
+    #        lần chạy sau mất toàn bộ dữ liệu cũ, buộc phải chạy lại từ đầu.
+    # → Giờ khoá theo (fold, model) và GIỮ checkpoint. Đồng thời lưu
+    #   y_true/y_pred để phân tích per-emotion / confusion về sau mà KHÔNG
+    #   phải train lại (trước đây _row() vứt bỏ predictions).
     for name, tr, te, g in splits:
         print(f"\n{'─'*64}\n  {name}  |  VRAM: {gpu_mem()}\n{'─'*64}")
+        fold_key = name.split()[0]
 
-        ck = OUT_DIR / f"_bench_{name.split()[0]}.json"
-        if ck.exists() and not args.force:
-            saved = json.loads(ck.read_text())
-            print(f"  [RESUME] đã có → bỏ qua")
-            rows.extend(saved)
-            continue
+        # Tương thích ngược: đọc checkpoint ĐỊNH DẠNG CŨ nếu còn trên disk.
+        legacy = OUT_DIR / f"_bench_{fold_key}.json"
+        legacy_by_model = {}
+        if legacy.exists():
+            try:
+                legacy_by_model = {r["Model"]: r
+                                   for r in json.loads(legacy.read_text())}
+            except (json.JSONDecodeError, KeyError, TypeError):
+                print(f"  [WARN] Checkpoint cũ {legacy.name} hỏng → bỏ qua")
 
-        fold_rows = []
-        if "A" in args.models:
-            r = run_A_frozen_svm(X_emb, y, tr, te)
-            print(f"  [A. frozen+SVM   ] Acc={r['Accuracy(%)']:.2f}%  "
-                  f"F1={r['F1_macro(%)']:.2f}%  ({r['Time(s)']:.0f}s)")
-            fold_rows.append(_row("A. HuBERT frozen + SVM", name, r))
+        for code in args.models:
+            model_name = MODEL_NAMES[code]
+            ck = OUT_DIR / f"_bench_{fold_key}_{code}.json"
 
-        if "B" in args.models:
-            r = run_B_attgate(X_hc, X_emb, y, tr, te, n_cls, actors, spk_disjoint)
-            print(f"  [B. AttGate      ] Acc={r['Accuracy(%)']:.2f}%  "
-                  f"F1={r['F1_macro(%)']:.2f}%  ({r['Time(s)']:.0f}s)")
-            fold_rows.append(_row("B. AttGate Fusion", name, r))
+            if ck.exists() and not args.force:
+                saved = json.loads(ck.read_text())
+                print(f"  [RESUME] {model_name} → bỏ qua "
+                      f"({saved['row']['Accuracy(%)']:.2f}%)")
+                continue
 
-        if "C" in args.models:
-            r = run_C_finetune(waves, y, tr, te, n_cls, epochs, actors, spk_disjoint)
-            gap = r.get("val_acc", 0) - r["Accuracy(%)"]
-            print(f"  [C. fine-tuned   ] Acc={r['Accuracy(%)']:.2f}%  "
-                  f"F1={r['F1_macro(%)']:.2f}%  ({r['Time(s)']:.0f}s)")
-            print(f"       val_acc (cùng actor) = {r.get('val_acc',0):.2f}%  "
-                  f"→ khoảng cách leakage = {gap:+.2f}%")
-            fold_rows.append(_row("C. HuBERT fine-tuned", name, r))
+            if model_name in legacy_by_model and not args.force:
+                # Nâng cấp sang định dạng mới. Checkpoint cũ KHÔNG có
+                # predictions nên per-emotion sẽ thiếu model này cho tới khi
+                # chạy lại với --force.
+                row = legacy_by_model[model_name]
+                OUT_DIR.mkdir(parents=True, exist_ok=True)
+                ck.write_text(json.dumps({"row": row,
+                                          "y_true": None, "y_pred": None}))
+                print(f"  [RESUME-CŨ] {model_name} → chuyển đổi định dạng "
+                      f"({row['Accuracy(%)']:.2f}%, không có predictions)")
+                continue
 
-        OUT_DIR.mkdir(parents=True, exist_ok=True)
-        ck.write_text(json.dumps(fold_rows))
-        rows.extend(fold_rows)
-        pd.DataFrame(rows).to_csv(out("results_partial.csv"), index=False)
+            if code == "A":
+                r = run_A_frozen_svm(X_emb, y, tr, te)
+                print(f"  [A. frozen+SVM   ] Acc={r['Accuracy(%)']:.2f}%  "
+                      f"F1={r['F1_macro(%)']:.2f}%  ({r['Time(s)']:.0f}s)")
+            elif code == "B":
+                r = run_B_attgate(X_hc, X_emb, y, tr, te, n_cls, actors,
+                                  spk_disjoint)
+                print(f"  [B. AttGate      ] Acc={r['Accuracy(%)']:.2f}%  "
+                      f"F1={r['F1_macro(%)']:.2f}%  ({r['Time(s)']:.0f}s)")
+            else:
+                r = run_C_finetune(waves, y, tr, te, n_cls, epochs, actors,
+                                   spk_disjoint)
+                gap = r.get("val_acc", 0) - r["Accuracy(%)"]
+                print(f"  [C. fine-tuned   ] Acc={r['Accuracy(%)']:.2f}%  "
+                      f"F1={r['F1_macro(%)']:.2f}%  ({r['Time(s)']:.0f}s)")
+                print(f"       val_acc (cùng actor) = {r.get('val_acc',0):.2f}%  "
+                      f"→ khoảng cách leakage = {gap:+.2f}%")
 
-    # ── Tổng hợp ─────────────────────────────────────────────────────────────
+            OUT_DIR.mkdir(parents=True, exist_ok=True)
+            ck.write_text(json.dumps({
+                "row":    _row(model_name, name, r),
+                "y_true": np.asarray(r["y_true"]).tolist(),
+                "y_pred": np.asarray(r["y_pred"]).tolist(),
+            }))
+
+    # ── Tổng hợp: quét LẠI toàn bộ checkpoint trên disk ──────────────────────
+    # Giống cơ chế của speaker_adversarial.py: bảng kết quả luôn đầy đủ mọi
+    # model đã từng chạy, kể cả khi chạy tách nhiều lần / nhiều phiên Colab.
+    rows, preds = [], {}
+    for ck in sorted(OUT_DIR.glob("_bench_*_[ABC].json")):
+        s = json.loads(ck.read_text())
+        rows.append(s["row"])
+        if s.get("y_true") is not None:
+            p = preds.setdefault(s["row"]["Model"], {"true": [], "pred": []})
+            p["true"].extend(s["y_true"])
+            p["pred"].extend(s["y_pred"])
+
     df = pd.DataFrame(rows)
+    if df.empty:
+        print("\n[WARN] Chưa có checkpoint nào — dừng.")
+        return
+    df = df.sort_values(["Model", "Fold"]).reset_index(drop=True)
     df.to_csv(out("results_speaker_independent.csv"), index=False)
+    print(f"\n[INFO] Gộp {df['Model'].nunique()} model × "
+          f"{df['Fold'].nunique()} fold từ {len(rows)} checkpoint bền vững.")
 
     print("\n" + "=" * 72)
     print("  KẾT QUẢ – LEAVE-ONE-SPEAKER-GROUP-OUT")
@@ -749,9 +899,17 @@ def main() -> None:
             print("  [WARN] Cần scipy: pip install scipy")
 
     plot_comparison(df)
+    per_emotion_analysis(preds, le)
 
-    for f in OUT_DIR.glob("_bench_*.json"):
-        f.unlink()
+    # KHÔNG xoá _bench_*.json nữa. Chúng là nguồn dữ liệu bền vững: giữ lại thì
+    # chạy bổ sung model khác ở phiên Colab sau vẫn ra bảng đầy đủ, và
+    # predictions bên trong là thứ sinh ra bảng per-emotion mà không phải
+    # train lại. Muốn chạy lại từ đầu → dùng --force.
+    # Dọn checkpoint ĐỊNH DẠNG CŨ (tên không có hậu tố _A/_B/_C) — dữ liệu
+    # trong đó đã được chuyển sang định dạng mới ở vòng trên.
+    for legacy in OUT_DIR.glob("_bench_*.json"):
+        if not legacy.stem.endswith(("_A", "_B", "_C")):
+            legacy.unlink()
     p = Path(out("results_partial.csv"))
     if p.exists():
         p.unlink()
@@ -760,6 +918,11 @@ def main() -> None:
     print("  HOÀN THÀNH – Output:")
     print(f"  • {out('results_speaker_independent.csv')}")
     print(f"  • {out('speaker_independent_comparison.png')}")
+    if preds:
+        print(f"  • {out('per_emotion_speaker_independent.csv')}")
+        print(f"  • confusion_A/B/C.png")
+    print(f"  • {len(list(OUT_DIR.glob('_bench_*_[ABC].json')))} checkpoint "
+          f"(giữ lại để chạy bổ sung / phân tích sau)")
     print("=" * 72 + "\n")
 
 
