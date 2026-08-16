@@ -634,6 +634,56 @@ def plot_ablation(summ: pd.DataFrame) -> None:
 
 
 # ============================================================================
+# KIỂM ĐỊNH THỐNG KÊ ĐA-METRIC (local — không phụ thuộc paired_tests import)
+# ============================================================================
+
+def _paired_tests_local(df: pd.DataFrame, metric_col: str) -> pd.DataFrame:
+    """
+    Paired t-test + Wilcoxon + Cohen's d cho mọi cặp cấu hình, trên một metric.
+
+    Local implementation — không phụ thuộc `paired_tests` từ speaker_independent_benchmark,
+    vì hàm đó chỉ hỗ trợ Accuracy. Ở đây cần chạy cho cả Accuracy, F1 VÀ speaker-probe
+    (speaker-probe là finding chính của cải tiến #3, cần kiểm định thống kê riêng).
+    """
+    from scipy import stats as _stats
+
+    piv = df.pivot(index="Fold", columns="Config", values=metric_col)
+    piv = piv.reindex(columns=[c for c in CONFIGS if c in piv.columns])
+    piv = piv.dropna()
+    if piv.empty or piv.shape[1] < 2:
+        return pd.DataFrame()
+
+    rows = []
+    cfgs = list(piv.columns)
+    for i in range(len(cfgs)):
+        for j in range(i + 1, len(cfgs)):
+            a_name, b_name = cfgs[i], cfgs[j]
+            a, b = piv[a_name].values, piv[b_name].values
+            diff = b - a
+            try:
+                _, p_t = _stats.ttest_rel(b, a)
+            except Exception:
+                p_t = float("nan")
+            try:
+                _, p_w = _stats.wilcoxon(b, a)
+            except Exception:
+                p_w = float("nan")
+            sd = float(diff.std(ddof=1))
+            d_val = float(diff.mean()) / sd if sd > 0 else 0.0
+            rows.append({
+                "So sánh":     f"{a_name} vs {b_name}",
+                "Δ mean":      round(float(diff.mean()), 2),
+                "t-test p":    round(float(p_t), 4) if not np.isnan(p_t) else np.nan,
+                "Wilcoxon p":  round(float(p_w), 4) if not np.isnan(p_w) else np.nan,
+                "Cohen_d":     round(d_val, 2),
+                "n_fold":      int(len(diff)),
+                "Kết luận":    ("có ý nghĩa (p<0.05)" if not np.isnan(p_t) and p_t < 0.05
+                                else "KHÔNG đủ bằng chứng"),
+            })
+    return pd.DataFrame(rows)
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
@@ -827,7 +877,8 @@ def main() -> None:
         pd.DataFrame(conf_rows).to_csv(out("confusion_pairs.csv"), index=False)
 
     # ── Kiểm định thống kê ───────────────────────────────────────────────────
-    # Chạy trên TOÀN BỘ config có trên disk, không chỉ args.configs.
+    # Chạy trên TOÀN BỘ config có trên disk, cho CẢ 3 metric: Accuracy, F1, speaker-probe.
+    # Speaker-probe là finding chính của cải tiến #3 — bắt buộc kiểm định riêng.
     n_cfgs_on_disk = df["Config"].nunique()
     if df["Fold"].nunique() >= 3 and n_cfgs_on_disk > 1:
         print("\n" + "=" * 74)
@@ -835,12 +886,43 @@ def main() -> None:
               f"{n_cfgs_on_disk} cấu hình)")
         print("=" * 74)
         try:
-            d2 = df.rename(columns={"Config": "Model"})
-            st = paired_tests(d2)
-            if not st.empty:
-                print(st.to_string(index=False))
-                st.to_csv(out("statistical_tests_adversarial.csv"), index=False)
-                print("\n  [LƯU Ý] n=6 → Wilcoxon p sàn = 0.0312. Dùng t-test + Cohen's d.")
+            metrics_to_test = [
+                ("Accuracy(%)",  "Accuracy"),
+                ("F1_macro(%)",  "F1-macro"),
+                ("spk_probe(%)", "Speaker-probe (leakage)"),
+            ]
+            all_tests = []
+            for col, label in metrics_to_test:
+                if col not in df.columns or df[col].isna().all():
+                    continue
+                st = _paired_tests_local(df, col)
+                if st.empty:
+                    continue
+                st.insert(0, "Metric", label)
+                all_tests.append(st)
+
+                print(f"\n  ── {label} ──")
+                print(st.drop(columns=["Metric"]).to_string(index=False))
+
+                sig = st[st["t-test p"] < 0.05]
+                if not sig.empty:
+                    print(f"  → {len(sig)} cặp có ý nghĩa (p<0.05) trên {label}:")
+                    for _, r in sig.iterrows():
+                        d_col = r["Cohen_d"]
+                        print(f"     • {r['So sánh']}: Δ={r['Δ mean']:+.2f}, "
+                              f"p={r['t-test p']:.4f}, d={d_col:+.2f}")
+
+            if all_tests:
+                st_all = pd.concat(all_tests, ignore_index=True)
+                st_all.to_csv(out("statistical_tests_adversarial.csv"), index=False)
+
+            n_tests = sum(len(s) for s in all_tests)
+            print(f"\n  [LƯU Ý] n=6 → Wilcoxon p sàn lý thuyết = 0.0312.")
+            print(f"           Ưu tiên đọc t-test + Cohen's d; Wilcoxon để tham khảo chéo.")
+            if n_tests > 1:
+                bonf = 0.05 / n_tests
+                print(f"           Multiple comparisons: {n_tests} test tổng → "
+                      f"Bonferroni threshold = 0.05/{n_tests} ≈ {bonf:.4f}")
         except ImportError:
             print("  [WARN] Cần scipy")
 
