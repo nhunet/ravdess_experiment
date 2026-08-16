@@ -100,6 +100,7 @@ warnings.filterwarnings("ignore")
 from hubert_finetune import (
     HubertSER, RavdessDataset, load_ravdess_16k, set_seed, free_gpu, gpu_mem,
     _repair_pos_conv,                      # ← FIX #1: bắt buộc, dùng cho A/B
+    AttentionPooling,                       # dùng cho baseline G (Wav2Vec2)
     TARGET_SR, MAX_SAMPLES, EMOTIONS, RANDOM_SEED,
     BATCH_SIZE, GRAD_ACCUM, LR_BACKBONE, LR_HEAD, WEIGHT_DECAY,
     WARMUP_RATIO, PATIENCE, LABEL_SMOOTH, VAL_RATIO,
@@ -152,6 +153,16 @@ MODEL_NAMES = {
     "A": "A. HuBERT frozen + SVM",
     "B": "B. AttGate Fusion",
     "C": "C. HuBERT fine-tuned",
+    # ── 4 baseline bổ sung (lấp lỗ hổng 7.1 #2 của báo cáo tháng 7): ─────────
+    # Các bài SER trước đây báo cáo trên RAVDESS ở 5-fold ngẫu nhiên với các
+    # kiến trúc CNN/LSTM/CRNN, và Wav2Vec2 là backbone SSL "kinh điển" cạnh
+    # tranh HuBERT. Chưa có so sánh dưới cùng giao thức LOSGO trên chính
+    # RAVDESS. Bốn model dưới đây train trên cùng splits, cùng val strategy
+    # speaker-disjoint, cùng epochs/patience — để so công bằng với A/B/C.
+    "D": "D. CNN2D on MFCC",
+    "E": "E. BiLSTM on MFCC",
+    "F": "F. CRNN (Conv+BiLSTM) on MFCC",
+    "G": "G. Wav2Vec2 fine-tuned",
 }
 
 # Thứ tự cảm xúc để vẽ (LabelEncoder sắp xếp theo alphabet, không theo thứ tự này)
@@ -520,6 +531,366 @@ def run_C_finetune(waves, y, tr, te, n_cls, epochs, actors, spk_disjoint) -> dic
 
 
 # ============================================================================
+# PHẦN 3B: BASELINE DEEP LEARNING (D, E, F, G)
+# ----------------------------------------------------------------------------
+# Lấp lỗ hổng 7.1 #2 của báo cáo tháng 7: chưa có CNN/LSTM/CRNN/Wav2Vec2 dưới
+# LOSGO. Bốn model dưới đây train trên CÙNG splits, val speaker-disjoint,
+# epochs, patience như model C, để so công bằng.
+# ============================================================================
+
+# Params riêng cho MFCC time-series (không đụng extract_mfcc_hc dùng cho B)
+N_MFCC_SEQ  = 40    # số hệ số MFCC (chuẩn cho SER)
+HOP_SEQ     = 512   # hop → T ≈ 130 frames với DURATION=3s @ 22.05 kHz
+BATCH_MFCC  = 32    # MFCC nhẹ hơn waveform nhiều, tăng batch lên
+EPOCHS_MFCC = 60    # tăng epochs vì mô hình nhỏ, hội tụ chậm hơn
+LR_MFCC     = 1e-3  # LR chuẩn cho model random-init
+WD_MFCC     = 1e-4
+PATIENCE_MFCC = 10  # nới patience vì val có thể dao động
+
+
+def extract_mfcc_seq(waves22k: np.ndarray) -> np.ndarray:
+    """
+    MFCC theo trục thời gian → (N, F, T) — cho CNN2D/LSTM/CRNN.
+
+    Khác extract_mfcc_hc (dùng cho model B): hàm đó ĐÃ nén thời gian bằng
+    mean/std → vector 240-d tĩnh, không phù hợp cho model có cấu trúc temporal.
+
+    Chuẩn hoá per-utterance (z-score) để CNN/LSTM ổn định — không dùng
+    StandardScaler global vì mỗi mẫu là một chuỗi.
+    """
+    print(f"  [MFCC-seq] Trích MFCC theo thời gian ({N_MFCC_SEQ} coef)...")
+    feats = []
+    for i, y in enumerate(waves22k):
+        if i % 400 == 0:
+            print(f"      {i}/{len(waves22k)}")
+        m = librosa.feature.mfcc(y=y, sr=SR_HC, n_mfcc=N_MFCC_SEQ,
+                                 n_fft=N_FFT, hop_length=HOP_SEQ)
+        feats.append(m.astype(np.float32))
+    # waveform đã pad về DURATION cố định nên T đồng đều; safe cắt về min
+    T = min(f.shape[1] for f in feats)
+    X = np.stack([f[:, :T] for f in feats])
+    mean = X.mean(axis=(1, 2), keepdims=True)
+    std = X.std(axis=(1, 2), keepdims=True) + 1e-8
+    X = (X - mean) / std
+    print(f"  [MFCC-seq] shape={X.shape}  (N, F, T)")
+    return X
+
+
+class _MFCCDataset(torch.utils.data.Dataset):
+    """(N, F, T) → tensor, không augment (dùng chung cho D/E/F)."""
+    def __init__(self, X: np.ndarray, y: np.ndarray) -> None:
+        self.X = X
+        self.y = y
+    def __len__(self) -> int:
+        return len(self.y)
+    def __getitem__(self, i):
+        return (torch.from_numpy(self.X[i]),
+                torch.tensor(self.y[i], dtype=torch.long))
+
+
+# ── D. CNN2D on MFCC spectrogram ────────────────────────────────────────────
+class _CNN2D_SER(nn.Module):
+    """
+    Coi MFCC (F, T) như ảnh 1 kênh. Kiến trúc chuẩn Issa et al. 2020 (rút gọn)
+    — 3 khối Conv+BN+ReLU+MaxPool + AdaptiveAvgPool + MLP head.
+    Chọn kiến trúc phổ biến/đủ mạnh, không tối ưu quá — mục tiêu là baseline
+    trung thực chứ không phải leaderboard.
+    """
+    def __init__(self, n_classes: int) -> None:
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2), nn.Dropout2d(0.25),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2), nn.Dropout2d(0.25),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((4, 4)), nn.Dropout2d(0.3),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128 * 16, 256), nn.ReLU(inplace=True), nn.Dropout(0.4),
+            nn.Linear(256, n_classes),
+        )
+    def forward(self, x):
+        # (B, F, T) → (B, 1, F, T)
+        if x.dim() == 3:
+            x = x.unsqueeze(1)
+        return self.classifier(self.features(x))
+
+
+# ── E. BiLSTM on MFCC sequence ──────────────────────────────────────────────
+class _BiLSTM_SER(nn.Module):
+    """
+    BiLSTM 2 lớp × 128 hidden trên MFCC theo trục thời gian. Mean-pool để
+    giữ nguyên chi phí tính so với B0 (embedding-only) của cải tiến #2.
+    """
+    def __init__(self, n_classes: int, input_dim: int = N_MFCC_SEQ) -> None:
+        super().__init__()
+        self.lstm = nn.LSTM(input_dim, 128, num_layers=2, batch_first=True,
+                            bidirectional=True, dropout=0.3)
+        self.classifier = nn.Sequential(
+            nn.Linear(256, 128), nn.ReLU(inplace=True), nn.Dropout(0.3),
+            nn.Linear(128, n_classes),
+        )
+    def forward(self, x):
+        # (B, F, T) → (B, T, F) để LSTM nhận đúng thứ tự (batch, seq, feat)
+        if x.dim() == 3 and x.shape[1] == N_MFCC_SEQ:
+            x = x.transpose(1, 2)
+        out, _ = self.lstm(x)          # (B, T, 256)
+        return self.classifier(out.mean(dim=1))
+
+
+# ── F. CRNN (Conv trên freq, LSTM trên time) ────────────────────────────────
+class _CRNN_SER(nn.Module):
+    """
+    3 khối Conv2D chỉ pool theo trục freq (giữ nguyên time) → reshape → BiLSTM.
+    Là kết hợp phổ biến của SER (Trigeorgis et al. 2016-style):
+      • CNN học đặc trưng local trên freq axis
+      • LSTM học phụ thuộc dài trên time axis
+    Sau 3 lần MaxPool((2,1)) trên trục freq: F 40 → 5 → mỗi time-step có
+    128×5=640 feature.
+    """
+    def __init__(self, n_classes: int) -> None:
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+            nn.MaxPool2d((2, 1)), nn.Dropout2d(0.25),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.MaxPool2d((2, 1)), nn.Dropout2d(0.25),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.MaxPool2d((2, 1)), nn.Dropout2d(0.3),
+        )
+        self.lstm = nn.LSTM(128 * (N_MFCC_SEQ // 8), 128, num_layers=2,
+                            batch_first=True, bidirectional=True, dropout=0.3)
+        self.classifier = nn.Sequential(
+            nn.Linear(256, 128), nn.ReLU(inplace=True), nn.Dropout(0.4),
+            nn.Linear(128, n_classes),
+        )
+    def forward(self, x):
+        if x.dim() == 3:
+            x = x.unsqueeze(1)
+        h = self.conv(x)                # (B, C, F', T)
+        b, c, f, t = h.shape
+        h = h.permute(0, 3, 1, 2).reshape(b, t, c * f)  # (B, T, C·F')
+        out, _ = self.lstm(h)
+        return self.classifier(out.mean(dim=1))
+
+
+def _train_mfcc_model(model: nn.Module, X: np.ndarray, y: np.ndarray,
+                      tr: np.ndarray, te: np.ndarray, actors: np.ndarray,
+                      spk_disjoint: bool, epochs: int = EPOCHS_MFCC) -> dict:
+    """Hàm train chung cho D/E/F: MFCC input, cross-entropy, AdamW, early-stop."""
+    set_seed(RANDOM_SEED)
+    t0 = time.time()
+    real_tr, real_val = make_val_split(tr, y, actors, spk_disjoint)
+
+    kw = dict(pin_memory=(DEVICE.type == "cuda"),
+              num_workers=2 if DEVICE.type == "cuda" else 0)
+    tr_dl = DataLoader(_MFCCDataset(X[real_tr], y[real_tr]),
+                       batch_size=BATCH_MFCC, shuffle=True, drop_last=True, **kw)
+    val_dl = DataLoader(_MFCCDataset(X[real_val], y[real_val]),
+                        batch_size=BATCH_MFCC, **kw)
+    te_dl = DataLoader(_MFCCDataset(X[te], y[te]),
+                       batch_size=BATCH_MFCC, **kw)
+
+    model = model.to(DEVICE)
+    opt = torch.optim.AdamW(model.parameters(), lr=LR_MFCC, weight_decay=WD_MFCC)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    lossfn = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH)
+    scaler = torch.amp.GradScaler(enabled=(DEVICE.type == "cuda"))
+
+    best_f1, best_state, bad, best_val_acc = 0.0, None, 0, 0.0
+
+    for _ep in range(epochs):
+        model.train()
+        for xb, yb in tr_dl:
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            opt.zero_grad()
+            with torch.autocast(device_type=DEVICE.type,
+                                enabled=(DEVICE.type == "cuda")):
+                loss = lossfn(model(xb), yb)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(opt); scaler.update()
+        sch.step()
+
+        vp, vt = _evaluate(model, val_dl)
+        vf1 = f1_score(vt, vp, average="macro", zero_division=0)
+
+        if vf1 > best_f1:
+            best_f1, bad = vf1, 0
+            best_val_acc = accuracy_score(vt, vp) * 100
+            best_state = {k: v.detach().cpu().clone()
+                          for k, v in model.state_dict().items()}
+        else:
+            bad += 1
+            if bad >= PATIENCE_MFCC:
+                break
+
+    if best_state:
+        model.load_state_dict(best_state)
+
+    p, t = _evaluate(model, te_dl)
+    r = _metrics(t, p, time.time() - t0)
+    r["val_acc"] = best_val_acc
+    free_gpu(model)
+    return r
+
+
+def run_D_cnn2d(X_mfcc, y, tr, te, n_cls, actors, spk_disjoint,
+                epochs: int = EPOCHS_MFCC):
+    """D. CNN2D on MFCC."""
+    return _train_mfcc_model(_CNN2D_SER(n_cls), X_mfcc, y, tr, te,
+                             actors, spk_disjoint, epochs=epochs)
+
+
+def run_E_bilstm(X_mfcc, y, tr, te, n_cls, actors, spk_disjoint,
+                 epochs: int = EPOCHS_MFCC):
+    """E. BiLSTM on MFCC."""
+    return _train_mfcc_model(_BiLSTM_SER(n_cls), X_mfcc, y, tr, te,
+                             actors, spk_disjoint, epochs=epochs)
+
+
+def run_F_crnn(X_mfcc, y, tr, te, n_cls, actors, spk_disjoint,
+               epochs: int = EPOCHS_MFCC):
+    """F. CRNN (Conv + BiLSTM) on MFCC."""
+    return _train_mfcc_model(_CRNN_SER(n_cls), X_mfcc, y, tr, te,
+                             actors, spk_disjoint, epochs=epochs)
+
+
+# ── G. Wav2Vec2 fine-tuned (mirror HubertSER architecture) ──────────────────
+class _Wav2Vec2SER(nn.Module):
+    """
+    Mirror HubertSER (weighted layer-sum + attention pooling + embed_fc +
+    classifier), chỉ đổi backbone → Wav2Vec2-base. Cùng head → so công bằng
+    "HuBERT vs Wav2Vec2 as pretrained backbone".
+
+    Không cần _repair_pos_conv — bug weight_norm mà FIX #8 vá chỉ ảnh hưởng
+    HuBERT trong transformers 4.51; Wav2Vec2 dùng parametrization khác và
+    HuggingFace ánh xạ đúng.
+    """
+    HIDDEN = 768
+    EMBED_DIM = 256
+
+    def __init__(self, n_classes: int,
+                 model_name: str = "facebook/wav2vec2-base") -> None:
+        super().__init__()
+        from transformers import Wav2Vec2Model, Wav2Vec2Config
+        cfg = Wav2Vec2Config.from_pretrained(model_name)
+        cfg.output_hidden_states = True
+        self.wav2vec = Wav2Vec2Model.from_pretrained(model_name, config=cfg)
+        # Đóng băng CNN feature extractor (chuẩn khi fine-tune SSL cho SER)
+        try:
+            self.wav2vec.feature_extractor._freeze_parameters()
+        except AttributeError:
+            for p in self.wav2vec.feature_extractor.parameters():
+                p.requires_grad = False
+
+        n_layers = cfg.num_hidden_layers
+        self.layer_weights = nn.Parameter(torch.zeros(n_layers + 1))
+        self.pool = AttentionPooling(self.HIDDEN)
+        self.embed_fc = nn.Sequential(
+            nn.Linear(self.HIDDEN, self.EMBED_DIM), nn.ReLU(), nn.Dropout(0.1),
+        )
+        self.classifier = nn.Linear(self.EMBED_DIM, n_classes)
+
+    def forward(self, x):
+        out = self.wav2vec(x)
+        # weighted layer-sum
+        hs = torch.stack(out.hidden_states, dim=0)     # (L+1, B, T, H)
+        w = torch.softmax(self.layer_weights, dim=0)
+        h = (hs * w.view(-1, 1, 1, 1)).sum(dim=0)      # (B, T, H)
+        return self.classifier(self.embed_fc(self.pool(h)))
+
+
+def run_G_wav2vec2_ft(waves, y, tr, te, n_cls, epochs, actors, spk_disjoint):
+    """
+    G. Wav2Vec2 fine-tuned — copy pipeline của run_C_finetune, chỉ đổi model.
+    Cùng optimizer (discriminative LR: backbone chậm, head nhanh), cùng
+    OneCycleLR + AMP + grad clip → so công bằng với C.
+    """
+    set_seed(RANDOM_SEED)
+    t0 = time.time()
+    real_tr, real_val = make_val_split(tr, y, actors, spk_disjoint)
+
+    kw = dict(pin_memory=(DEVICE.type == "cuda"),
+              num_workers=2 if DEVICE.type == "cuda" else 0)
+    tr_dl = DataLoader(RavdessDataset(waves[real_tr], y[real_tr]),
+                       batch_size=BATCH_SIZE, shuffle=True, drop_last=True, **kw)
+    val_dl = DataLoader(RavdessDataset(waves[real_val], y[real_val]),
+                        batch_size=BATCH_SIZE, **kw)
+    te_dl = DataLoader(RavdessDataset(waves[te], y[te]),
+                       batch_size=BATCH_SIZE, **kw)
+
+    model = _Wav2Vec2SER(n_cls).to(DEVICE)
+
+    # Discriminative LR: backbone (pretrained) học chậm; head học nhanh
+    backbone, head = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        (backbone if name.startswith("wav2vec") else head).append(p)
+    opt = torch.optim.AdamW(
+        [{"params": backbone, "lr": LR_BACKBONE},
+         {"params": head,     "lr": LR_HEAD}],
+        weight_decay=WEIGHT_DECAY)
+
+    lossfn = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH)
+    scaler = torch.amp.GradScaler(enabled=(DEVICE.type == "cuda"))
+    steps = max(1, (len(tr_dl) // GRAD_ACCUM) * epochs)
+    sch = torch.optim.lr_scheduler.OneCycleLR(
+        opt, max_lr=[LR_BACKBONE, LR_HEAD],
+        total_steps=steps, pct_start=WARMUP_RATIO)
+
+    best_f1, best_state, bad, best_val_acc = 0.0, None, 0, 0.0
+
+    for _ep in range(epochs):
+        model.train()
+        opt.zero_grad()
+        for i, (xb, yb) in enumerate(tr_dl):
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            with torch.autocast(device_type=DEVICE.type,
+                                enabled=(DEVICE.type == "cuda")):
+                loss = lossfn(model(xb), yb) / GRAD_ACCUM
+            scaler.scale(loss).backward()
+            if (i + 1) % GRAD_ACCUM == 0:
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(opt); scaler.update(); opt.zero_grad()
+                if sch.last_epoch < steps - 1:
+                    sch.step()
+
+        vp, vt = _evaluate(model, val_dl)
+        vf1 = f1_score(vt, vp, average="macro", zero_division=0)
+
+        if vf1 > best_f1:
+            best_f1, bad = vf1, 0
+            best_val_acc = accuracy_score(vt, vp) * 100
+            best_state = {k: v.detach().cpu().clone()
+                          for k, v in model.state_dict().items()}
+        else:
+            bad += 1
+            if bad >= PATIENCE:
+                break
+
+    if best_state:
+        model.load_state_dict(best_state)
+
+    p, t = _evaluate(model, te_dl)
+    r = _metrics(t, p, time.time() - t0)
+    r["val_acc"] = best_val_acc
+    free_gpu(model)
+    return r
+
+
+# ============================================================================
 # PHẦN 4: VISUALIZATION
 # ============================================================================
 
@@ -708,9 +1079,14 @@ def plot_comparison(df: pd.DataFrame) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--models", nargs="+", default=["A", "B", "C"],
-                    choices=["A", "B", "C"],
-                    help="A=frozen+SVM  B=AttGate  C=fine-tuned")
+                    choices=list(MODEL_NAMES),
+                    help="A=frozen+SVM  B=AttGate  C=HuBERT-FT  "
+                         "D=CNN2D  E=BiLSTM  F=CRNN  G=Wav2Vec2-FT "
+                         "(D/E/F/G bổ sung để lấp lỗ hổng 7.1 #2 của báo cáo 07)")
     ap.add_argument("--epochs", type=int, default=30)
+    ap.add_argument("--epochs-mfcc", type=int, default=EPOCHS_MFCC,
+                    help="Epochs cho D/E/F (mặc định 60; mô hình nhỏ nên có thể "
+                         "chạy nhiều epochs mà vẫn nhanh)")
     ap.add_argument("--quick", action="store_true", help="2 fold, 10 epochs")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--val-random", action="store_true",
@@ -720,6 +1096,7 @@ def main() -> None:
     spk_disjoint = not args.val_random
 
     epochs = 10 if args.quick else args.epochs
+    epochs_mfcc = 10 if args.quick else args.epochs_mfcc
     n_grp = 2 if args.quick else 6
 
     print("\n" + "=" * 72)
@@ -742,14 +1119,21 @@ def main() -> None:
         print(f"    {name}: train={len(tr)}  test={len(te)}")
 
     # ── Trích đặc trưng 1 LẦN (dùng chung mọi fold – tiết kiệm rất nhiều) ────
-    X_hc = X_emb = None
-    if "A" in args.models or "B" in args.models:
+    X_hc = X_emb = X_mfcc_seq = None
+    needs_hubert_emb = bool({"A", "B"} & set(args.models))
+    needs_mfcc_hc    = "B" in args.models
+    needs_mfcc_seq   = bool({"D", "E", "F"} & set(args.models))
+
+    if needs_hubert_emb:
         print("\n[INFO] Trích đặc trưng dùng chung...")
         X_emb = extract_hubert_frozen(waves)
-    if "B" in args.models:
+    if needs_mfcc_hc or needs_mfcc_seq:
         # FIX #2: load audio ở 22050Hz GỐC, không upsample từ 16k
         waves22 = load_ravdess_22k("./RAVDESS")
-        X_hc = extract_mfcc_hc(waves22)
+        if needs_mfcc_hc:
+            X_hc = extract_mfcc_hc(waves22)
+        if needs_mfcc_seq:
+            X_mfcc_seq = extract_mfcc_seq(waves22)
         del waves22
 
     # ── VÁ LỖI CHECKPOINT (2 lỗi thật, đều làm mất dữ liệu) ──────────────────
@@ -800,19 +1184,33 @@ def main() -> None:
 
             if code == "A":
                 r = run_A_frozen_svm(X_emb, y, tr, te)
-                print(f"  [A. frozen+SVM   ] Acc={r['Accuracy(%)']:.2f}%  "
-                      f"F1={r['F1_macro(%)']:.2f}%  ({r['Time(s)']:.0f}s)")
             elif code == "B":
                 r = run_B_attgate(X_hc, X_emb, y, tr, te, n_cls, actors,
                                   spk_disjoint)
-                print(f"  [B. AttGate      ] Acc={r['Accuracy(%)']:.2f}%  "
-                      f"F1={r['F1_macro(%)']:.2f}%  ({r['Time(s)']:.0f}s)")
-            else:
+            elif code == "C":
                 r = run_C_finetune(waves, y, tr, te, n_cls, epochs, actors,
                                    spk_disjoint)
+            elif code == "D":
+                r = run_D_cnn2d(X_mfcc_seq, y, tr, te, n_cls, actors,
+                                spk_disjoint, epochs=epochs_mfcc)
+            elif code == "E":
+                r = run_E_bilstm(X_mfcc_seq, y, tr, te, n_cls, actors,
+                                 spk_disjoint, epochs=epochs_mfcc)
+            elif code == "F":
+                r = run_F_crnn(X_mfcc_seq, y, tr, te, n_cls, actors,
+                               spk_disjoint, epochs=epochs_mfcc)
+            elif code == "G":
+                r = run_G_wav2vec2_ft(waves, y, tr, te, n_cls, epochs, actors,
+                                      spk_disjoint)
+            else:
+                raise ValueError(f"Unknown model code: {code}")
+
+            label = model_name.split(".")[0]
+            print(f"  [{label}. {model_name.split('.',1)[1].strip()[:22]:<22s}] "
+                  f"Acc={r['Accuracy(%)']:.2f}%  F1={r['F1_macro(%)']:.2f}%  "
+                  f"({r['Time(s)']:.0f}s)")
+            if code in ("C", "G"):
                 gap = r.get("val_acc", 0) - r["Accuracy(%)"]
-                print(f"  [C. fine-tuned   ] Acc={r['Accuracy(%)']:.2f}%  "
-                      f"F1={r['F1_macro(%)']:.2f}%  ({r['Time(s)']:.0f}s)")
                 print(f"       val_acc (cùng actor) = {r.get('val_acc',0):.2f}%  "
                       f"→ khoảng cách leakage = {gap:+.2f}%")
 
@@ -827,7 +1225,7 @@ def main() -> None:
     # Giống cơ chế của speaker_adversarial.py: bảng kết quả luôn đầy đủ mọi
     # model đã từng chạy, kể cả khi chạy tách nhiều lần / nhiều phiên Colab.
     rows, preds = [], {}
-    for ck in sorted(OUT_DIR.glob("_bench_*_[ABC].json")):
+    for ck in sorted(OUT_DIR.glob("_bench_*_[A-G].json")):
         s = json.loads(ck.read_text())
         rows.append(s["row"])
         if s.get("y_true") is not None:
@@ -908,7 +1306,7 @@ def main() -> None:
     # Dọn checkpoint ĐỊNH DẠNG CŨ (tên không có hậu tố _A/_B/_C) — dữ liệu
     # trong đó đã được chuyển sang định dạng mới ở vòng trên.
     for legacy in OUT_DIR.glob("_bench_*.json"):
-        if not legacy.stem.endswith(("_A", "_B", "_C")):
+        if not legacy.stem.endswith(tuple(f"_{c}" for c in MODEL_NAMES)):
             legacy.unlink()
     p = Path(out("results_partial.csv"))
     if p.exists():
@@ -921,7 +1319,7 @@ def main() -> None:
     if preds:
         print(f"  • {out('per_emotion_speaker_independent.csv')}")
         print(f"  • confusion_A/B/C.png")
-    print(f"  • {len(list(OUT_DIR.glob('_bench_*_[ABC].json')))} checkpoint "
+    print(f"  • {len(list(OUT_DIR.glob('_bench_*_[A-G].json')))} checkpoint "
           f"(giữ lại để chạy bổ sung / phân tích sau)")
     print("=" * 72 + "\n")
 
