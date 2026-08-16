@@ -191,6 +191,26 @@ def out(f: str) -> str:
     return str(OUT_DIR / f)
 
 
+def _infer_seed(path: Path, default: int) -> int:
+    """
+    Suy ra seed cho các checkpoint CŨ (ghi trước khi có trường "Seed").
+
+    Quy ước của run_seed_sweep.sh: mỗi seed có thư mục riêng dạng
+    .../outputs_speaker_adversarial/seed_43/_adv_base_G1.json
+    → lấy số từ tên thư mục. Không khớp thì dùng `default` (seed hiện tại).
+
+    Dùng re.search chứ KHÔNG phải fullmatch: docstring đầu file hướng dẫn
+    cả dạng OUT_DIR=./out_seed43, mà fullmatch thì trượt tên đó.
+    Lấy thư mục GẦN file nhất trở ra để tên cha không ghi đè tên con.
+    """
+    import re
+    for part in reversed(path.resolve().parts):
+        m = re.search(r"seed[_-]?(\d+)", part, flags=re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+    return default
+
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 EPOCHS_DEFAULT = 30
@@ -512,7 +532,12 @@ def train_config(waves, y, actors, tr, te, n_cls, cfg: dict,
     t0 = time.time()
     use_aug, use_grl = cfg["aug"], cfg["grl"]
 
-    real_tr, real_val = make_val_split(tr, y, actors, speaker_disjoint=True)
+    # VÁ LỖI MULTI-SEED: truyền seed vào để mỗi seed chọn bộ 4 diễn viên
+    # validation KHÁC nhau. Trước đây make_val_split dùng cứng RANDOM_SEED=42
+    # của hubert_finetune nên 3 seed dùng chung một val split → variance bị
+    # đánh giá thấp. Với SEED=42 kết quả không đổi (RandomState(42) như cũ).
+    real_tr, real_val = make_val_split(tr, y, actors, speaker_disjoint=True,
+                                       seed=RANDOM_SEED)
 
     # ── Nhãn speaker: ánh xạ actor → 0..N-1 TRONG TRAIN FOLD ────────────────
     spk_tr = None
@@ -811,10 +836,20 @@ def _paired_tests_local(df: pd.DataFrame, metric_col: str) -> pd.DataFrame:
     Local implementation — không phụ thuộc `paired_tests` từ speaker_independent_benchmark,
     vì hàm đó chỉ hỗ trợ Accuracy. Ở đây cần chạy cho cả Accuracy, F1 VÀ speaker-probe
     (speaker-probe là finding chính của cải tiến #3, cần kiểm định thống kê riêng).
+
+    ── VÁ LỖI ĐA SEED ───────────────────────────────────────────────────────
+    Bản trước dùng df.pivot(index="Fold", ...). Khi dữ liệu chứa nhiều seed,
+    mỗi Fold xuất hiện nhiều lần → pandas ném ValueError "Index contains
+    duplicate entries, cannot reshape" và toàn bộ phần thống kê chết.
+    Giờ ghép cặp theo (Seed, Fold) khi có cột Seed → n = n_seed × n_fold.
     """
     from scipy import stats as _stats
 
-    piv = df.pivot(index="Fold", columns="Config", values=metric_col)
+    # Đơn vị ghép cặp: một lần train = (Seed, Fold). Không có cột Seed
+    # (checkpoint cũ) thì rơi về Fold như trước.
+    idx_cols = ["Seed", "Fold"] if "Seed" in df.columns else ["Fold"]
+    piv = df.pivot_table(index=idx_cols, columns="Config",
+                         values=metric_col, aggfunc="mean")
     piv = piv.reindex(columns=[c for c in CONFIGS if c in piv.columns])
     piv = piv.dropna()
     if piv.empty or piv.shape[1] < 2:
@@ -906,6 +941,10 @@ def main() -> None:
             row = {
                 "Config":       cfg_name,
                 "Fold":         name,
+                # Ghi seed vào từng checkpoint để merge_seeds.py ghép cặp đúng
+                # (Seed, Fold) khi gộp nhiều seed. Checkpoint CŨ không có
+                # trường này — được backfill khi quét, xem _infer_seed().
+                "Seed":         RANDOM_SEED,
                 "Accuracy(%)":  round(r["Accuracy(%)"], 2),
                 "F1_macro(%)":  round(r["F1_macro(%)"], 2),
                 "Precision(%)": round(r["Precision(%)"], 2),
@@ -943,6 +982,9 @@ def main() -> None:
     for ck in all_ckpts:
         s = json.loads(ck.read_text())
         cfg = s["row"]["Config"]
+        # Backfill cho checkpoint ghi trước khi có trường "Seed" (ví dụ lần
+        # chạy seed 42 đang diễn ra) — không phải chạy lại gì cả.
+        s["row"].setdefault("Seed", _infer_seed(ck, RANDOM_SEED))
         rows.append(s["row"])
         preds.setdefault(cfg, {"true": [], "pred": []})
         preds[cfg]["true"].extend(s["y_true"])
@@ -1103,9 +1145,15 @@ def main() -> None:
     # Chạy trên TOÀN BỘ config có trên disk, cho CẢ 3 metric: Accuracy, F1, speaker-probe.
     # Speaker-probe là finding chính của cải tiến #3 — bắt buộc kiểm định riêng.
     n_cfgs_on_disk = df["Config"].nunique()
-    if df["Fold"].nunique() >= 3 and n_cfgs_on_disk > 1:
+    # Đơn vị ghép cặp là (Seed, Fold), không phải Fold — nếu thư mục này chứa
+    # nhiều seed thì n lớn hơn số fold.
+    _pair_cols = ["Seed", "Fold"] if "Seed" in df.columns else ["Fold"]
+    n_pairs = len(df[_pair_cols].drop_duplicates())
+    n_seeds = df["Seed"].nunique() if "Seed" in df.columns else 1
+    if n_pairs >= 3 and n_cfgs_on_disk > 1:
         print("\n" + "=" * 74)
-        print(f"  KIỂM ĐỊNH THỐNG KÊ (paired, n={df['Fold'].nunique()} fold, "
+        print(f"  KIỂM ĐỊNH THỐNG KÊ (paired, n={n_pairs} = "
+              f"{n_seeds} seed × {df['Fold'].nunique()} fold, "
               f"{n_cfgs_on_disk} cấu hình)")
         print("=" * 74)
         try:
@@ -1148,7 +1196,15 @@ def main() -> None:
                 st_all.to_csv(out("statistical_tests_adversarial.csv"), index=False)
 
             n_tests = sum(len(s) for s in all_tests)
-            print(f"\n  [LƯU Ý] n=6 → Wilcoxon p sàn lý thuyết = 0.0312.")
+            # p sàn của Wilcoxon = 2 / 2^n (two-sided). Với n=6 → 0.0312 (không
+            # bao giờ < 0.05); với n=18 (3 seed) → ~7.6e-6, hết bị chặn.
+            w_floor = 2.0 ** (-n_pairs) * 2
+            print(f"\n  [LƯU Ý] n={n_pairs} → Wilcoxon p sàn lý thuyết = {w_floor:.2e}.")
+            if w_floor > 0.05:
+                print(f"           p sàn > 0.05 → Wilcoxon KHÔNG THỂ đạt ý nghĩa dù "
+                      f"thắng {n_pairs}/{n_pairs}.")
+                print(f"           Đây là giới hạn toán học của mẫu nhỏ, không phải "
+                      f"bằng chứng chênh lệch là nhiễu.")
             print(f"           Ưu tiên đọc t-test + Cohen's d; Wilcoxon để tham khảo chéo.")
             if n_tests > 1:
                 bonf = 0.05 / n_tests
