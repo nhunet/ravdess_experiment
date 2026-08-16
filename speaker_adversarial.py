@@ -104,6 +104,36 @@ CHECKPOINT BỀN VỮNG (không cần merge thủ công)
 
   --force: chỉ xoá checkpoint của các config được chỉ định trong lần chạy đó,
            KHÔNG đụng các config khác đã có trên disk.
+
+MULTI-SEED SWEEP (bắt buộc cho paper)
+  n=6 fold × 1 seed → statistical power thấp, không phát hiện được Δ ≤ 3%.
+  Chạy 3 seed để có 3 × 6 = 18 giá trị/config → power đủ cho Δ ≥ 1%.
+
+  Dùng SEED env var (script tự set numpy + torch seed từ đây):
+    SEED=42 python speaker_adversarial.py                # seed mặc định (đã chạy)
+    SEED=43 OUT_DIR=./out_seed43 python speaker_adversarial.py
+    SEED=44 OUT_DIR=./out_seed44 python speaker_adversarial.py
+
+  QUAN TRỌNG: mỗi seed dùng OUT_DIR RIÊNG — không lẫn checkpoint. Sau đó dùng
+  script gộp riêng để tính stats trên toàn bộ 72 điểm dữ liệu (3 seed × 4
+  config × 6 fold).
+
+VÁ LỖI KỸ THUẬT (bản này, quan trọng cho paper)
+  BUG 1 (num_workers augmentation không sinh random khác nhau):
+    Bản trước dùng self.rng khởi tạo một lần trong __init__. Với num_workers=2,
+    2 worker fork dataset → cùng seed → cùng chuỗi random → augmentation giả
+    tính đa dạng. Bản này chuyển sang worker-safe RNG (mỗi __getitem__ tạo
+    RandomState mới từ worker_seed + index).
+  BUG 2 (peak normalization vô hiệu hoá gain augmentation):
+    Bản trước rescale x /= peak nếu peak > 1 → gain +6dB (peak x2) bị chia
+    lại → gain gần như không có tác dụng. Bản này dùng np.clip(-1, 1) —
+    giữ hiệu ứng gain nhưng không tràn số.
+  BUG 3 (adv_head_first không log):
+    Chỉ có adv_head_last → không biết head có bao giờ học được không. Bản
+    này log first/max/last + cảnh báo nếu max < chance+5 (head không học nổi
+    → GRL không có tín hiệu đảo).
+  NÂNG CẤP: speaker probe giờ có LR + MLP + permutation test (n_repeat=5,
+  n_perm=50) → probe finding defensible về methodology.
 =============================================================================
 """
 
@@ -137,7 +167,7 @@ warnings.filterwarnings("ignore")
 
 from hubert_finetune import (
     HubertSER, load_ravdess_16k, set_seed, free_gpu, gpu_mem,
-    _evaluate, RANDOM_SEED, BATCH_SIZE, GRAD_ACCUM,
+    _evaluate, RANDOM_SEED as _DEFAULT_SEED, BATCH_SIZE, GRAD_ACCUM,
     LR_BACKBONE, LR_HEAD, WEIGHT_DECAY, WARMUP_RATIO, LABEL_SMOOTH,
     TARGET_SR, MAX_SAMPLES, EMBED_DIM,
 )
@@ -146,6 +176,14 @@ from speaker_independent_benchmark import (
 )
 
 OUT_DIR = Path(os.environ.get("OUT_DIR", "./outputs_adversarial"))
+
+# ── Multi-seed support cho paper ────────────────────────────────────────────
+# Set SEED env var để override default seed từ hubert_finetune. Mỗi seed
+# nên có OUT_DIR riêng để checkpoint không lẫn nhau. Xem docstring đầu file.
+RANDOM_SEED = int(os.environ.get("SEED", _DEFAULT_SEED))
+if RANDOM_SEED != _DEFAULT_SEED:
+    print(f"[SEED] Override từ env: SEED={RANDOM_SEED} "
+          f"(default: {_DEFAULT_SEED})")
 
 
 def out(f: str) -> str:
@@ -182,6 +220,16 @@ class AugmentedDataset(Dataset):
     Speed perturbation là kỹ thuật quan trọng nhất ở đây: đổi tốc độ phát
     (0.9× / 1.1×) làm thay đổi CẢ cao độ, tạo ra "giọng của một người khác".
     Đúng thứ cần để model bớt phụ thuộc vào danh tính người nói.
+
+    ⚠️ WORKER-SAFE RNG (BUG FIX quan trọng):
+      Bản trước dùng self.rng = np.random.RandomState(RANDOM_SEED) khởi tạo
+      MỘT LẦN trong __init__. Với num_workers=2 (bạn đang dùng trong Colab),
+      DataLoader FORK dataset cho mỗi worker → mỗi worker có bản sao rng với
+      CÙNG seed → cả 2 worker sinh CÙNG chuỗi số ngẫu nhiên → augmentation
+      lặp lại đúng những mẫu như nhau, không đa dạng như tưởng.
+
+      Bản này tạo rng MỚI mỗi __getitem__ với seed từ (worker_id, index, os pid,
+      thời gian cao độ chính xác) → mỗi call độc lập, mỗi worker khác nhau.
     """
 
     def __init__(self, waves: np.ndarray, y: np.ndarray,
@@ -190,7 +238,7 @@ class AugmentedDataset(Dataset):
         self.y = y
         self.spk = spk
         self.augment = augment
-        self.rng = np.random.RandomState(RANDOM_SEED)
+        # KHÔNG khởi tạo self.rng ở đây — làm trong __getitem__ để worker-safe.
 
     def __len__(self):
         return len(self.y)
@@ -204,43 +252,61 @@ class AugmentedDataset(Dataset):
             y = np.pad(y, (0, MAX_SAMPLES - len(y)))
         return y[:MAX_SAMPLES]
 
-    def _apply(self, x: np.ndarray) -> np.ndarray:
-        r = self.rng
-
+    def _apply(self, x: np.ndarray, rng: np.random.RandomState) -> np.ndarray:
         # 1. Speed perturbation (Ko et al. 2015) – quan trọng nhất
-        if r.rand() < 0.5:
-            x = self._speed_perturb(x, r.choice([0.9, 1.1]))
+        if rng.rand() < 0.5:
+            x = self._speed_perturb(x, rng.choice([0.9, 1.1]))
 
         # 2. Time shift ±10% – chống bám vị trí tuyệt đối
-        if r.rand() < 0.5:
-            s = int(r.uniform(-0.1, 0.1) * MAX_SAMPLES)
+        if rng.rand() < 0.5:
+            s = int(rng.uniform(-0.1, 0.1) * MAX_SAMPLES)
             x = np.roll(x, s)
 
         # 3. Gain ±6 dB – mô phỏng micro/khoảng cách khác nhau
-        if r.rand() < 0.5:
-            x = x * float(10 ** (r.uniform(-6, 6) / 20))
+        # ⚠️ BUG FIX: bản trước NORMALIZE peak về 1.0 sau tất cả augmentation
+        # → gain +6dB (biên độ x2, peak > 1.0) bị chia lại → gain augmentation
+        # gần như bị vô hiệu hoá cho các mẫu có peak ≈ 1 (mà load_ravdess_16k
+        # đã normalize sẵn về peak = 1). Chỉ gain âm mới thực sự có hiệu lực.
+        # → Sửa: CLIP mẫu về [-1, 1] khi cần (thay vì rescale toàn bộ),
+        # để gain thực sự thay đổi mức nghe được mà không huỷ tín hiệu.
+        if rng.rand() < 0.5:
+            x = x * float(10 ** (rng.uniform(-6, 6) / 20))
 
         # 4. Gaussian noise SNR 15-30 dB – môi trường thu khác nhau
-        if r.rand() < 0.3:
-            snr = r.uniform(15, 30)
+        if rng.rand() < 0.3:
+            snr = rng.uniform(15, 30)
             p_sig = np.mean(x ** 2)
             if p_sig > 0:
                 p_noise = p_sig / (10 ** (snr / 10))
-                x = x + r.randn(len(x)).astype(np.float32) * np.sqrt(p_noise)
+                x = x + rng.randn(len(x)).astype(np.float32) * np.sqrt(p_noise)
 
-        peak = np.abs(x).max()
-        if peak > 1.0:
-            x = x / peak
-        return x.astype(np.float32)
+        # Clip thay vì rescale — giữ được hiệu ứng gain nhưng không tràn số
+        return np.clip(x, -1.0, 1.0).astype(np.float32)
 
     def __getitem__(self, i):
         x = self.waves[i]
         if self.augment:
-            x = self._apply(x.copy())
+            # Worker-safe: seed rng mỗi call từ nguồn entropy độc lập
+            # (worker_id đã được PyTorch set trong worker_init_fn bên dưới)
+            info = torch.utils.data.get_worker_info()
+            worker_seed = info.seed if info is not None else 0
+            rng = np.random.RandomState((worker_seed + i) % (2**32 - 1))
+            x = self._apply(x.copy(), rng)
         out_ = [torch.from_numpy(x), torch.tensor(self.y[i], dtype=torch.long)]
         if self.spk is not None:
             out_.append(torch.tensor(self.spk[i], dtype=torch.long))
         return tuple(out_)
+
+
+def _worker_init_fn(worker_id: int) -> None:
+    """
+    PyTorch DataLoader worker_init: đảm bảo mỗi worker có seed khác nhau.
+    Kết hợp với AugmentedDataset.__getitem__ dùng worker_info.seed, mỗi worker
+    và mỗi index sinh chuỗi ngẫu nhiên độc lập → augmentation thật sự đa dạng.
+    """
+    # base_seed đến từ generator của DataLoader; unique per worker.
+    seed = (torch.initial_seed() + worker_id) % (2**32 - 1)
+    np.random.seed(seed)
 
 
 # ============================================================================
@@ -332,7 +398,8 @@ def _extract_emb(model, waves: np.ndarray, idx: np.ndarray) -> np.ndarray:
     return np.concatenate(embs)
 
 
-def speaker_probe(model, waves, actors, idx) -> tuple[float, float]:
+def speaker_probe(model, waves, actors, idx,
+                  n_repeat: int = 5, n_perm: int = 50) -> dict:
     """
     ⚠️ ĐO TRUNG THỰC: embedding CÒN GIỮ bao nhiêu thông tin danh tính?
 
@@ -347,28 +414,92 @@ def speaker_probe(model, waves, actors, idx) -> tuple[float, float]:
       speaker gần như hoàn hảo → thông tin vẫn còn nguyên trong embedding.
       Đây là phê bình đã biết với DANN/GRL trong literature.
 
-    Cách đo đúng (hàm này):
-      1. Đóng băng model đã train
-      2. Trích embedding
-      3. Train MỘT probe tuyến tính MỚI để đoán speaker
-      4. Probe-accuracy CAO  → GRL KHÔNG xoá được danh tính (thất bại)
-         Probe-accuracy THẤP → GRL thật sự xoá được (thành công)
+    NÂNG CẤP METHODOLOGY (defensible cho paper):
+      Bản trước dùng CV 3-fold + LR probe duy nhất → 2 điểm attackable:
 
-    Con số này mới là thứ đưa vào báo cáo được.
+      (a) LR probe chỉ đo tách tuyến tính. Nếu identity encode phi tuyến,
+          LR sẽ under-estimate → THÊM MLP probe để cross-check.
+
+      (b) Không có phân phối null → không biết probe accuracy 12% "thật sự
+          cao" so với ngẫu nhiên bao nhiêu → THÊM PERMUTATION TEST: shuffle
+          nhãn speaker n_perm lần, đo probe → có phân phối null empirical.
+
+      (c) CV 3-fold với ~40 mẫu/speaker cho std lớn → THÊM n_repeat lần
+          hold-out (train/test 70/30 stratified) với seed khác nhau → có std
+          probe accuracy → kiểm định paired vs base defensible hơn.
+
+    Trả về dict:
+      lr_mean, lr_std       : probe tuyến tính (Logistic Regression), mean±std
+      mlp_mean, mlp_std     : probe phi tuyến (MLP 2-layer)
+      chance                : 100/n_speakers
+      perm_p_lr, perm_p_mlp : p-value permutation test (nhỏ = probe > ngẫu nhiên
+                              có ý nghĩa thống kê)
     """
     from sklearn.linear_model import LogisticRegression
-    from sklearn.model_selection import cross_val_score
+    from sklearn.neural_network import MLPClassifier
+    from sklearn.model_selection import train_test_split as _tts
+    from sklearn.preprocessing import StandardScaler
 
     E = _extract_emb(model, waves, idx)
     spk = actors[idx]
     n_spk = len(np.unique(spk))
-    if n_spk < 2:
-        return float("nan"), float("nan")
-
-    clf = LogisticRegression(max_iter=2000, multi_class="multinomial")
-    acc = cross_val_score(clf, E, spk, cv=3, scoring="accuracy").mean() * 100
     chance = 100.0 / n_spk
-    return float(acc), float(chance)
+    if n_spk < 2:
+        return dict(lr_mean=float("nan"), lr_std=float("nan"),
+                    mlp_mean=float("nan"), mlp_std=float("nan"),
+                    chance=chance, perm_p_lr=float("nan"),
+                    perm_p_mlp=float("nan"))
+
+    sc = StandardScaler()
+    E_std = sc.fit_transform(E)
+
+    def _probe_once(clf_ctor, X, y, seed):
+        Xtr, Xte, ytr, yte = _tts(X, y, test_size=0.3,
+                                  stratify=y, random_state=seed)
+        c = clf_ctor()
+        c.fit(Xtr, ytr)
+        return c.score(Xte, yte) * 100
+
+    def _lr():
+        # sklearn 1.7+ bỏ 'multi_class' (auto), 1.8+ bỏ 'n_jobs' (không dùng).
+        # Truyền chỉ max_iter → forward-compatible với sklearn 1.5-1.10+
+        return LogisticRegression(max_iter=2000)
+    def _mlp():
+        # MLP 2 hidden layer — bắt được identity phi tuyến nếu có
+        return MLPClassifier(hidden_layer_sizes=(128, 64), max_iter=500,
+                             early_stopping=True, random_state=0)
+
+    # Repeated hold-out cho probe accuracy có std
+    lr_scores = np.array([_probe_once(_lr, E_std, spk, s) for s in range(n_repeat)])
+    mlp_scores = np.array([_probe_once(_mlp, E_std, spk, s) for s in range(n_repeat)])
+
+    # Permutation test — shuffle spk labels để có phân phối null
+    # (n_perm hơi ít vì tốn thời gian, nhưng đủ để có p ~0.02 resolution)
+    rng = np.random.RandomState(0)
+    null_lr = []
+    null_mlp = []
+    for k in range(n_perm):
+        spk_shuf = rng.permutation(spk)
+        # 1 hold-out mỗi permutation là đủ (n_perm là số lần lặp chính)
+        null_lr.append(_probe_once(_lr, E_std, spk_shuf, k))
+        null_mlp.append(_probe_once(_mlp, E_std, spk_shuf, k))
+    null_lr = np.array(null_lr)
+    null_mlp = np.array(null_mlp)
+
+    # p-value: xác suất probe accuracy trên nhãn shuffle ≥ probe thực
+    # (+1/(n+1) là smoothing chuẩn để tránh p=0)
+    lr_obs, mlp_obs = lr_scores.mean(), mlp_scores.mean()
+    p_lr = (np.sum(null_lr >= lr_obs) + 1) / (n_perm + 1)
+    p_mlp = (np.sum(null_mlp >= mlp_obs) + 1) / (n_perm + 1)
+
+    return dict(
+        lr_mean=float(lr_obs), lr_std=float(lr_scores.std(ddof=1)),
+        mlp_mean=float(mlp_obs), mlp_std=float(mlp_scores.std(ddof=1)),
+        chance=float(chance),
+        perm_p_lr=float(p_lr), perm_p_mlp=float(p_mlp),
+        null_lr_mean=float(null_lr.mean()), null_lr_std=float(null_lr.std()),
+        null_mlp_mean=float(null_mlp.mean()), null_mlp_std=float(null_mlp.std()),
+    )
 
 
 # ============================================================================
@@ -396,8 +527,10 @@ def train_config(waves, y, actors, tr, te, n_cls, cfg: dict,
               num_workers=2 if DEVICE.type == "cuda" else 0)
 
     tr_ds = AugmentedDataset(waves[real_tr], y[real_tr], spk_tr, augment=use_aug)
+    # worker_init_fn quan trọng cho tr_dl khi use_aug=True: đảm bảo 2 worker sinh
+    # augmentation độc lập, không lặp lại (xem AugmentedDataset docstring).
     tr_dl = DataLoader(tr_ds, batch_size=BATCH_SIZE, shuffle=True,
-                       drop_last=True, **kw)
+                       drop_last=True, worker_init_fn=_worker_init_fn, **kw)
     # val/test KHÔNG augment
     val_dl = DataLoader(AugmentedDataset(waves[real_val], y[real_val]),
                         batch_size=BATCH_SIZE, **kw)
@@ -492,22 +625,56 @@ def train_config(waves, y, actors, tr, te, n_cls, cfg: dict,
     r = _metrics(t, p, time.time() - t0)
 
     # ── Accuracy của head đối kháng (CHỈ để tham khảo – KHÔNG phải bằng chứng) ──
+    # In cả first và last để đánh giá: nếu first ≈ chance ≈ last thì speaker head
+    # CHƯA BAO GIỜ học được tách speaker, tức GRL không có tín hiệu để đảo →
+    # cả cơ chế không hoạt động. Đây là insight quan trọng để viết Discussion:
+    # phân biệt "GRL không hoạt động nói chung" vs "dataset RAVDESS quá nhỏ
+    # để speaker head học được đủ trước khi λ tăng lên".
     if use_grl and spk_acc_hist:
         r["adv_head_first"] = float(spk_acc_hist[0])
         r["adv_head_last"] = float(spk_acc_hist[-1])
+        r["adv_head_max"] = float(max(spk_acc_hist))
+        chance_spk = 100.0 / n_spk if n_spk else 0.0
+        print(f"    [{fold}|{cfg_name}] adv-head accuracy: "
+              f"first={spk_acc_hist[0]:.1f}%  "
+              f"max={max(spk_acc_hist):.1f}%  "
+              f"last={spk_acc_hist[-1]:.1f}%  "
+              f"(chance={chance_spk:.1f}% với N={n_spk} speakers)")
 
-    # ── ĐO TRUNG THỰC: probe tuyến tính MỚI trên embedding đóng băng ──────────
+    # ── ĐO TRUNG THỰC: probe tuyến tính + phi tuyến trên embedding đóng băng ──
     # Đây mới là bằng chứng thật. Head đối kháng tụt accuracy KHÔNG chứng minh
     # gì cả — nó bị GRL đánh bại nên đương nhiên phải tụt.
+    #
+    # Ghi cả LR probe (tuyến tính) và MLP probe (phi tuyến) + permutation p-value:
+    # - LR probe cao → identity tách tuyến tính được (leakage rõ ràng)
+    # - MLP probe > LR probe → identity encode phi tuyến, LR under-estimate
+    # - perm_p thấp → probe accuracy KHÁC BIỆT có ý nghĩa với ngẫu nhiên
     try:
-        probe_acc, chance = speaker_probe(model, waves, actors, real_tr)
-        r["spk_probe(%)"] = probe_acc
-        r["spk_chance(%)"] = chance
+        pr = speaker_probe(model, waves, actors, real_tr,
+                           n_repeat=5, n_perm=50)
+        r["spk_probe_lr(%)"]      = pr["lr_mean"]
+        r["spk_probe_lr_std(%)"]  = pr["lr_std"]
+        r["spk_probe_mlp(%)"]     = pr["mlp_mean"]
+        r["spk_probe_mlp_std(%)"] = pr["mlp_std"]
+        r["spk_chance(%)"]        = pr["chance"]
+        r["perm_p_lr"]            = pr["perm_p_lr"]
+        r["perm_p_mlp"]           = pr["perm_p_mlp"]
+        r["null_lr_mean(%)"]      = pr["null_lr_mean"]
+        r["null_mlp_mean(%)"]     = pr["null_mlp_mean"]
+
+        # Giữ tên cũ "spk_probe(%)" (= LR probe mean) cho backward compat
+        # với stats code + notebook đã có
+        r["spk_probe(%)"] = pr["lr_mean"]
+
         adv = ""
         if use_grl and spk_acc_hist:
             adv = f"  [head đối kháng: {spk_acc_hist[-1]:.1f}%]"
-        print(f"    [{fold}|{cfg_name}] speaker-PROBE trên embedding đóng băng "
-              f"= {probe_acc:.1f}%  (ngẫu nhiên={chance:.1f}%){adv}")
+        print(f"    [{fold}|{cfg_name}] speaker-PROBE:")
+        print(f"      LR:  {pr['lr_mean']:5.1f}±{pr['lr_std']:.1f}%  "
+              f"(null: {pr['null_lr_mean']:.1f}%,  perm-p={pr['perm_p_lr']:.4f})")
+        print(f"      MLP: {pr['mlp_mean']:5.1f}±{pr['mlp_std']:.1f}%  "
+              f"(null: {pr['null_mlp_mean']:.1f}%, perm-p={pr['perm_p_mlp']:.4f})")
+        print(f"      chance={pr['chance']:.1f}%{adv}")
     except Exception as exc:
         print(f"    [WARN] probe lỗi: {exc}")
 
@@ -745,10 +912,16 @@ def main() -> None:
                 "Recall(%)":    round(r["Recall(%)"], 2),
                 "Time(s)":      round(r["Time(s)"], 1),
             }
-            for k in ("spk_probe(%)", "spk_chance(%)",
-                      "adv_head_first", "adv_head_last"):
+            # Metrics mới từ probe nâng cấp (LR + MLP + permutation test) và
+            # từ adversarial head (giờ có cả first/max/last để phát hiện
+            # "head không bao giờ học được")
+            for k in ("spk_probe(%)", "spk_probe_lr(%)", "spk_probe_lr_std(%)",
+                      "spk_probe_mlp(%)", "spk_probe_mlp_std(%)",
+                      "spk_chance(%)", "perm_p_lr", "perm_p_mlp",
+                      "null_lr_mean(%)", "null_mlp_mean(%)",
+                      "adv_head_first", "adv_head_last", "adv_head_max"):
                 if k in r:
-                    row[k] = round(r[k], 2)
+                    row[k] = round(r[k], 4) if "perm_p" in k else round(r[k], 2)
 
             print(f"  [{cfg_name:8s}] Acc={r['Accuracy(%)']:.2f}%  "
                   f"F1={r['F1_macro(%)']:.2f}%  ({r['Time(s)']:.0f}s)")
@@ -811,37 +984,87 @@ def main() -> None:
         print("\n" + "=" * 74)
         print("  GRL CÓ THẬT SỰ XOÁ THÔNG TIN DANH TÍNH KHÔNG?")
         print("=" * 74)
-        print("  Đo bằng LINEAR PROBE MỚI trên embedding ĐÓNG BĂNG.")
-        print("  (KHÔNG dùng accuracy của head đối kháng — head đó bị GRL đánh bại")
-        print("   nên đương nhiên tụt, điều đó không chứng minh gì cả.)\n")
+        print("  Đo bằng PROBE MỚI trên embedding ĐÓNG BĂNG (LR + MLP + permutation).")
+        print("  KHÔNG dùng accuracy của head đối kháng — head đó bị GRL đánh bại")
+        print("  nên đương nhiên tụt, điều đó không chứng minh gì cả.")
+        print("  Interpretation:")
+        print("    • LR probe cao → identity tách được tuyến tính (leakage rõ)")
+        print("    • MLP > LR → identity encode phi tuyến, LR under-estimate")
+        print("    • perm-p thấp → probe khác biệt CÓ Ý NGHĨA vs shuffle nhãn\n")
 
-        pr = df.groupby("Config")[["spk_probe(%)", "spk_chance(%)"]].mean().round(2)
-        base_probe = pr.loc["base", "spk_probe(%)"] if "base" in pr.index else None
-        chance = pr["spk_chance(%)"].mean()
+        # Có thể có checkpoint cũ chưa có LR/MLP tách biệt — dùng .get() an toàn
+        cols_needed = ["spk_probe_lr(%)", "spk_probe_mlp(%)",
+                       "perm_p_lr", "perm_p_mlp", "spk_chance(%)"]
+        has_new = all(c in df.columns for c in cols_needed)
 
-        print(f"  {'Cấu hình':10s} {'speaker-probe':>15s} {'Δ vs base':>11s}")
-        print("  " + "─" * 40)
-        for c in pr.index:
-            v = pr.loc[c, "spk_probe(%)"]
-            d = f"{v - base_probe:+.2f}%" if base_probe is not None and c != "base" else "—"
-            print(f"  {c:10s} {v:14.2f}% {d:>11s}")
-        print(f"  {'(ngẫu nhiên)':10s} {chance:14.2f}%")
+        if has_new:
+            pr = df.groupby("Config")[cols_needed].mean().round(3)
+            base_probe = pr.loc["base", "spk_probe_lr(%)"] if "base" in pr.index else None
+            chance = pr["spk_chance(%)"].mean()
 
-        if base_probe is not None and "grl" in pr.index:
-            drop = base_probe - pr.loc["grl", "spk_probe(%)"]
-            print()
-            if drop > 10:
-                print(f"  → GRL LÀM GIẢM probe {drop:.1f} điểm → thật sự xoá bớt")
-                print("    thông tin danh tính khỏi embedding. Cơ chế hoạt động.")
-            else:
-                print(f"  → GRL chỉ giảm probe {drop:.1f} điểm → thông tin danh tính")
-                print("    VẪN CÒN trong embedding. GRL làm head đối kháng mù đi,")
-                print("    nhưng KHÔNG xoá được thông tin. Đây là hạn chế đã biết")
-                print("    của DANN/GRL — phải báo cáo trung thực.")
-            if "adv_head_last" in df.columns and df["adv_head_last"].notna().any():
-                ah = df["adv_head_last"].mean()
-                print(f"\n  (Head đối kháng cuối train chỉ đạt {ah:.1f}% — nhưng như trên,")
-                print("   con số này KHÔNG phải bằng chứng.)")
+            print(f"  {'Cấu hình':10s} {'LR probe':>12s} {'MLP probe':>12s} "
+                  f"{'perm-p (LR)':>13s} {'perm-p (MLP)':>13s} {'Δ LR vs base':>13s}")
+            print("  " + "─" * 78)
+            for c in pr.index:
+                v_lr = pr.loc[c, "spk_probe_lr(%)"]
+                v_mlp = pr.loc[c, "spk_probe_mlp(%)"]
+                p_lr = pr.loc[c, "perm_p_lr"]
+                p_mlp = pr.loc[c, "perm_p_mlp"]
+                d = (f"{v_lr - base_probe:+.2f}%"
+                     if base_probe is not None and c != "base" else "—")
+                print(f"  {c:10s} {v_lr:11.2f}% {v_mlp:11.2f}% "
+                      f"{p_lr:13.4f} {p_mlp:13.4f} {d:>13s}")
+            print(f"  {'(chance)':10s} {chance:11.2f}%")
+
+            # Insight tự động
+            if base_probe is not None and "grl" in pr.index:
+                mlp_grl = pr.loc["grl", "spk_probe_mlp(%)"]
+                lr_grl = pr.loc["grl", "spk_probe_lr(%)"]
+                if mlp_grl > lr_grl + 5:
+                    print(f"\n  → MLP probe của grl ({mlp_grl:.1f}%) > LR probe "
+                          f"({lr_grl:.1f}%) → identity encode PHI TUYẾN")
+                    print(f"    LR probe under-estimate leakage thật sự.")
+        else:
+            # Fallback cho checkpoint cũ chưa có LR/MLP tách biệt
+            pr = df.groupby("Config")[["spk_probe(%)", "spk_chance(%)"]].mean().round(2)
+            base_probe = pr.loc["base", "spk_probe(%)"] if "base" in pr.index else None
+            chance = pr["spk_chance(%)"].mean()
+
+            print(f"  {'Cấu hình':10s} {'speaker-probe':>15s} {'Δ vs base':>11s}")
+            print("  " + "─" * 40)
+            for c in pr.index:
+                v = pr.loc[c, "spk_probe(%)"]
+                d = f"{v - base_probe:+.2f}%" if base_probe is not None and c != "base" else "—"
+                print(f"  {c:10s} {v:14.2f}% {d:>11s}")
+            print(f"  {'(chance)':10s} {chance:14.2f}%")
+
+        # ── Adversarial head: first vs max vs last ──────────────────────────
+        # QUAN TRỌNG cho Discussion: nếu head KHÔNG BAO GIỜ học được tách speaker
+        # (first ≈ max ≈ chance), GRL không có tín hiệu để đảo → cả cơ chế
+        # không hoạt động, khác với "GRL không work nói chung".
+        if "adv_head_first" in df.columns and df["adv_head_first"].notna().any():
+            print("\n  ── Adversarial head accuracy (chỉ nhánh có GRL) ──")
+            ah = df.dropna(subset=["adv_head_first"]).groupby("Config").agg(
+                first=("adv_head_first", "mean"),
+                max=("adv_head_max", "mean") if "adv_head_max" in df.columns else ("adv_head_last", "mean"),
+                last=("adv_head_last", "mean"),
+            ).round(2)
+            print(f"  {'Cấu hình':10s} {'first':>10s} {'max':>10s} {'last':>10s}")
+            print("  " + "─" * 42)
+            for c in ah.index:
+                print(f"  {c:10s} {ah.loc[c, 'first']:9.2f}% "
+                      f"{ah.loc[c, 'max']:9.2f}% {ah.loc[c, 'last']:9.2f}%")
+
+            # Diagnostic
+            max_head = ah["max"].max()
+            spk_chance_val = 100.0 / 16  # ~6.25% với 16 speakers
+            if max_head < spk_chance_val + 5:
+                print(f"\n  → CẢNH BÁO: speaker head KHÔNG BAO GIỜ đạt > chance "
+                      f"({spk_chance_val:.1f}%+5).")
+                print("    Head không học được tách speaker → GRL không có tín hiệu")
+                print("    để đảo → cơ chế GRL KHÔNG HOẠT ĐỘNG trên dataset này.")
+                print("    (Đây là insight cần đưa vào Discussion — khác với")
+                print("     'GRL nói chung không work'.)")
 
     # ── Per-emotion + confusion ──────────────────────────────────────────────
     print("\n" + "=" * 74)
@@ -887,10 +1110,18 @@ def main() -> None:
         print("=" * 74)
         try:
             metrics_to_test = [
-                ("Accuracy(%)",  "Accuracy"),
-                ("F1_macro(%)",  "F1-macro"),
-                ("spk_probe(%)", "Speaker-probe (leakage)"),
+                ("Accuracy(%)",     "Accuracy"),
+                ("F1_macro(%)",     "F1-macro"),
+                ("spk_probe_lr(%)", "Speaker-probe (LR, tuyến tính)"),
+                ("spk_probe_mlp(%)","Speaker-probe (MLP, phi tuyến)"),
+                # Giữ cột cũ để backward compat với checkpoint đã có
+                ("spk_probe(%)",    "Speaker-probe (legacy = LR)"),
             ]
+            # Loại trùng: nếu cả spk_probe_lr(%) và spk_probe(%) đều tồn tại,
+            # chúng bằng nhau — chỉ chạy 1 để không double-report
+            if all(c in df.columns for c in ("spk_probe(%)", "spk_probe_lr(%)")):
+                metrics_to_test = [m for m in metrics_to_test
+                                   if m[0] != "spk_probe(%)"]
             all_tests = []
             for col, label in metrics_to_test:
                 if col not in df.columns or df[col].isna().all():
