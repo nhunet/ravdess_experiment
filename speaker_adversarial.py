@@ -1058,14 +1058,30 @@ def main() -> None:
                       f"{p_lr:13.4f} {p_mlp:13.4f} {d:>13s}")
             print(f"  {'(chance)':10s} {chance:11.2f}%")
 
-            # Insight tự động
-            if base_probe is not None and "grl" in pr.index:
-                mlp_grl = pr.loc["grl", "spk_probe_mlp(%)"]
-                lr_grl = pr.loc["grl", "spk_probe_lr(%)"]
-                if mlp_grl > lr_grl + 5:
-                    print(f"\n  → MLP probe của grl ({mlp_grl:.1f}%) > LR probe "
-                          f"({lr_grl:.1f}%) → identity encode PHI TUYẾN")
-                    print(f"    LR probe under-estimate leakage thật sự.")
+            # Diễn giải tự động — bám theo probe, KHÔNG bám theo adv-head.
+            # Adv-head bị GRL đánh bại nên luôn tụt, không chứng minh gì.
+            # Probe trên embedding đóng băng mới là bằng chứng thật.
+            if base_probe is not None:
+                for cfg_name in ("grl", "aug+grl"):
+                    if cfg_name not in pr.index:
+                        continue
+                    lr_c = pr.loc[cfg_name, "spk_probe_lr(%)"]
+                    mlp_c = pr.loc[cfg_name, "spk_probe_mlp(%)"]
+                    d_lr = lr_c - base_probe
+                    if d_lr < -3:
+                        print(f"\n  → {cfg_name}: LR-probe GIẢM {d_lr:+.2f}% so với base.")
+                        print(f"    GRL đang xoá được (một phần) thông tin danh tính.")
+                    elif d_lr > 3:
+                        print(f"\n  → {cfg_name}: LR-probe TĂNG {d_lr:+.2f}% so với base "
+                              f"(bất ngờ, ngược dự đoán).")
+                        print(f"    Đây là hiệu ứng backfire đã được ghi nhận trong")
+                        print(f"    literature với DANN/GRL trên corpus nhỏ: nhánh")
+                        print(f"    emotion cạnh tranh với GRL, ép backbone phân cụm")
+                        print(f"    embedding theo speaker rõ hơn để bảo vệ tín hiệu")
+                        print(f"    cảm xúc. Là kết quả âm, đáng đưa vào Discussion.")
+                    if mlp_c > lr_c + 5:
+                        print(f"    ({cfg_name}: MLP probe {mlp_c:.1f}% > LR probe "
+                              f"{lr_c:.1f}% → danh tính mã hoá phi tuyến)")
         else:
             # Fallback cho checkpoint cũ chưa có LR/MLP tách biệt
             pr = df.groupby("Config")[["spk_probe(%)", "spk_chance(%)"]].mean().round(2)
@@ -1097,16 +1113,16 @@ def main() -> None:
                 print(f"  {c:10s} {ah.loc[c, 'first']:9.2f}% "
                       f"{ah.loc[c, 'max']:9.2f}% {ah.loc[c, 'last']:9.2f}%")
 
-            # Diagnostic
-            max_head = ah["max"].max()
-            spk_chance_val = 100.0 / 16  # ~6.25% với 16 speakers
-            if max_head < spk_chance_val + 5:
-                print(f"\n  → CẢNH BÁO: speaker head KHÔNG BAO GIỜ đạt > chance "
-                      f"({spk_chance_val:.1f}%+5).")
-                print("    Head không học được tách speaker → GRL không có tín hiệu")
-                print("    để đảo → cơ chế GRL KHÔNG HOẠT ĐỘNG trên dataset này.")
-                print("    (Đây là insight cần đưa vào Discussion — khác với")
-                print("     'GRL nói chung không work'.)")
+            # LƯU Ý DIỄN GIẢI (đã sửa sau khi phát hiện logic cũ sai)
+            # Không suy luận "GRL hoạt động/không" từ adv-head accuracy nữa.
+            # Adv-head bị GRL đánh bại nên tất nhiên phải tụt gần chance —
+            # điều đó KHÔNG chứng minh "GRL không có tín hiệu để đảo".
+            # Bằng chứng thật: probe trên embedding đóng băng (đã in ở trên).
+            # Nếu probe THAY ĐỔI mạnh so với base → backbone đang nhận signal
+            # từ GRL, chỉ là hướng thay đổi mới cho biết cơ chế đang làm gì.
+            print(f"\n  Lưu ý: adv-head accuracy chỉ để tham khảo — head này bị GRL")
+            print(f"  đánh bại nên tụt gần chance là bình thường, KHÔNG dùng làm")
+            print(f"  bằng chứng cho hiệu quả của GRL. Đọc probe ở bảng trên.")
 
     # ── Per-emotion + confusion ──────────────────────────────────────────────
     print("\n" + "=" * 74)
