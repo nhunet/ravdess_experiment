@@ -66,7 +66,7 @@ def boilerplate_cells(title: str, description: str, gpu_required: bool = True):
 print("CUDA available:", torch.cuda.is_available())
 if torch.cuda.is_available():
     print("GPU:", torch.cuda.get_device_name(0))
-    print("VRAM:", round(torch.cuda.get_device_properties(0).total_mem / 1e9, 1), "GB")
+    print("VRAM:", round(torch.cuda.get_device_properties(0).total_memory / 1e9, 1), "GB")
 else:
     print("WARNING: GPU not enabled! Runtime -> Change runtime type -> T4 GPU")"""),
 
