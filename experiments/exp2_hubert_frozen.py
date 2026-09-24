@@ -38,7 +38,7 @@ def run_exp2(dataset: RavdessDataset = None, force: bool = False):
     set_seed(config.DEFAULT_SEED)
     ensure_dirs()
 
-    out_csv = os.path.join(config.SAVE_DIR, "results_exp2_hubert_frozen.csv")
+    out_csv = os.path.join(config.CSV_DIR, "results_exp2_hubert_frozen.csv")
     if os.path.exists(out_csv) and not force:
         print(f"[INFO] Exp2 already done: {out_csv}")
         return pd.read_csv(out_csv)
@@ -51,7 +51,7 @@ def run_exp2(dataset: RavdessDataset = None, force: bool = False):
     print(f"[INFO] Using device: {device}")
 
     # Extract embeddings once
-    emb_path = os.path.join(config.SAVE_DIR, "hubert_frozen_embeddings.npy")
+    emb_path = os.path.join(config.EMB_DIR, "hubert_frozen_embeddings.npy")
     if os.path.exists(emb_path) and not force:
         print(f"[INFO] Loading cached embeddings from {emb_path}")
         X = np.load(emb_path)

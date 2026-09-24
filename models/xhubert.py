@@ -110,16 +110,21 @@ class xHuBERT(nn.Module):
         head_params = list(self.head.parameters())
 
         other_params = []
-        if self.use_sla:
-            other_params.append(self.layer_weights)
         if self.use_attention_pool:
             other_params.extend(self.pool.parameters())
 
-        return [
+        groups = [
             {"params": [p for p in backbone_params if p.requires_grad],
              "lr": config.BACKBONE_LR},
             {"params": head_params + other_params, "lr": config.HEAD_LR},
         ]
+        if self.use_sla:
+            groups.append({
+                "params": [self.layer_weights],
+                "lr": config.HEAD_LR,
+                "weight_decay": 0.0,
+            })
+        return groups
 
     def count_params(self) -> dict:
         total = sum(p.numel() for p in self.parameters())

@@ -44,7 +44,7 @@ def run_exp7(dataset: RavdessDataset = None, force: bool = False):
     set_seed(config.DEFAULT_SEED)
     ensure_dirs()
 
-    out_csv = os.path.join(config.SAVE_DIR, "results_exp7_layer_probing.csv")
+    out_csv = os.path.join(config.CSV_DIR, "results_exp7_layer_probing.csv")
     if os.path.exists(out_csv) and not force:
         print(f"[INFO] Exp7 already done: {out_csv}")
         return pd.read_csv(out_csv)
@@ -55,7 +55,7 @@ def run_exp7(dataset: RavdessDataset = None, force: bool = False):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Extract all layer embeddings
-    cache_path = os.path.join(config.SAVE_DIR, "hubert_all_layers.npz")
+    cache_path = os.path.join(config.EMB_DIR, "hubert_all_layers.npz")
     if os.path.exists(cache_path) and not force:
         print(f"[INFO] Loading cached layer embeddings from {cache_path}")
         data = np.load(cache_path)

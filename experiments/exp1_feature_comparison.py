@@ -17,7 +17,7 @@ def run_exp1(dataset: RavdessDataset = None, force: bool = False):
     set_seed(config.DEFAULT_SEED)
     ensure_dirs()
 
-    out_csv = os.path.join(config.SAVE_DIR, "results_exp1_feature_comparison.csv")
+    out_csv = os.path.join(config.CSV_DIR, "results_exp1_feature_comparison.csv")
     if os.path.exists(out_csv) and not force:
         print(f"[INFO] Exp1 already done: {out_csv}")
         return pd.read_csv(out_csv)
@@ -43,11 +43,6 @@ def run_exp1(dataset: RavdessDataset = None, force: bool = False):
                 fold_name = split["fold_name"]
                 train_idx = split["train_idx"]
                 test_idx = split["test_idx"]
-
-                # Filter indices that survived feature extraction
-                max_idx = len(y) - 1
-                train_idx = train_idx[train_idx <= max_idx]
-                test_idx = test_idx[test_idx <= max_idx]
 
                 X_train, y_train = X[train_idx], y[train_idx]
                 X_test, y_test = X[test_idx], y[test_idx]
@@ -81,7 +76,7 @@ def run_exp1(dataset: RavdessDataset = None, force: bool = False):
         F1_mean=("f1_macro", "mean"),
         F1_std=("f1_macro", "std"),
     ).round(2).reset_index()
-    pivot_csv = os.path.join(config.SAVE_DIR, "results_exp1_pivot.csv")
+    pivot_csv = os.path.join(config.CSV_DIR, "results_exp1_pivot.csv")
     pivot.to_csv(pivot_csv, index=False)
     print(f"[INFO] Saved {pivot_csv}")
 

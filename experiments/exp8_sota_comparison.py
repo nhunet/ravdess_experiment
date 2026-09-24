@@ -79,7 +79,7 @@ def run_exp8(dataset: RavdessDataset = None, force: bool = False,
     set_seed(config.DEFAULT_SEED)
     ensure_dirs()
 
-    out_csv = os.path.join(config.SAVE_DIR, "results_exp8_sota.csv")
+    out_csv = os.path.join(config.CSV_DIR, "results_exp8_sota.csv")
     if os.path.exists(out_csv) and not force:
         print(f"[INFO] Exp8 already done: {out_csv}")
         return pd.read_csv(out_csv)
@@ -100,7 +100,6 @@ def run_exp8(dataset: RavdessDataset = None, force: bool = False,
     # Extract LogMel spectrograms (2D) for CNN2D
     print("[INFO] Extracting LogMel spectrograms for CNN2D ...")
     spectrograms = []
-    spec_labels = []
     for i, y in enumerate(dataset.waveforms):
         try:
             mel = librosa.feature.melspectrogram(
@@ -110,15 +109,15 @@ def run_exp8(dataset: RavdessDataset = None, force: bool = False,
             )
             log_mel = librosa.power_to_db(mel, ref=np.max)
             spectrograms.append(log_mel)
-            spec_labels.append(dataset.labels[i])
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[WARN] Spectrogram {i} failed: {e} — using zeros")
+            spectrograms.append(np.zeros((config.N_MELS, 1)))
     # Pad spectrograms to same time length
     max_time = max(s.shape[1] for s in spectrograms)
     X_spec = np.zeros((len(spectrograms), 1, config.N_MELS, max_time), dtype=np.float32)
     for i, s in enumerate(spectrograms):
         X_spec[i, 0, :, :s.shape[1]] = s
-    y_spec = np.array(spec_labels)
+    y_spec = dataset.labels
 
     all_rows = []
 
@@ -148,16 +147,11 @@ def run_exp8(dataset: RavdessDataset = None, force: bool = False,
                 else:
                     train_idx = split["train_idx"]
                     val_size = max(1, len(train_idx) // 5)
+                    train_idx = train_idx.copy()
                     np.random.shuffle(train_idx)
                     val_idx = train_idx[:val_size]
                     train_idx = train_idx[val_size:]
                     test_idx = split["test_idx"]
-
-                # Clamp indices
-                max_idx = len(y) - 1
-                train_idx = train_idx[train_idx <= max_idx]
-                val_idx = val_idx[val_idx <= max_idx]
-                test_idx = test_idx[test_idx <= max_idx]
 
                 X_tr = torch.tensor(X[train_idx], dtype=torch.float32)
                 y_tr = torch.tensor(y[train_idx], dtype=torch.long)

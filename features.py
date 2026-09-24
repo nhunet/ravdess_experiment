@@ -220,18 +220,19 @@ FEATURE_EXTRACTORS["MFCC+Prosody"] = (extract_combined_mfcc_prosody, 274)
 def build_feature_matrix(waveforms: list[np.ndarray], labels: np.ndarray,
                          extractor_fn, expected_dim: int,
                          sr: int = config.SR_HANDCRAFTED) -> tuple[np.ndarray, np.ndarray]:
-    """Extract features for all waveforms, dropping samples that fail."""
+    """Extract features for all waveforms. Failures get zero vectors to preserve index alignment."""
     X_list, y_list = [], []
     for i, y in enumerate(waveforms):
         try:
             feat = extractor_fn(y, sr)
             if len(feat) != expected_dim:
-                print(f"[WARN] Sample {i}: got {len(feat)} dims, expected {expected_dim} — skipped")
-                continue
-            if np.any(np.isnan(feat)) or np.any(np.isinf(feat)):
+                print(f"[WARN] Sample {i}: got {len(feat)} dims, expected {expected_dim} — using zeros")
+                feat = np.zeros(expected_dim)
+            elif np.any(np.isnan(feat)) or np.any(np.isinf(feat)):
                 feat = np.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
-            X_list.append(feat)
-            y_list.append(labels[i])
         except Exception as e:
-            print(f"[WARN] Sample {i} failed: {e} — skipped")
+            print(f"[WARN] Sample {i} failed: {e} — using zeros")
+            feat = np.zeros(expected_dim)
+        X_list.append(feat)
+        y_list.append(labels[i])
     return np.array(X_list), np.array(y_list)

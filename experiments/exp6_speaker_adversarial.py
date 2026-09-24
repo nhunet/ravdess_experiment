@@ -51,9 +51,9 @@ class GRLSpeakerClassifier(nn.Module):
 
 # ─── Augmentation ───────────────────────────────────────────────────────────
 
-def augment_waveform(y: np.ndarray, sr: int) -> np.ndarray:
+def augment_waveform(y: np.ndarray, sr: int, seed: int = None) -> np.ndarray:
     """Apply random augmentation chain."""
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(seed)
 
     # Speed perturbation
     if rng.random() < config.AUG_PROBS["speed"]:
@@ -168,7 +168,7 @@ def run_exp6(dataset: RavdessDataset = None, force: bool = False,
     set_seed(config.DEFAULT_SEED)
     ensure_dirs()
 
-    out_csv = os.path.join(config.SAVE_DIR, "results_exp6_adversarial.csv")
+    out_csv = os.path.join(config.CSV_DIR, "results_exp6_adversarial.csv")
     if os.path.exists(out_csv) and not force:
         print(f"[INFO] Exp6 already done: {out_csv}")
         return pd.read_csv(out_csv)
@@ -209,11 +209,11 @@ def run_exp6(dataset: RavdessDataset = None, force: bool = False,
                 aug_labels = list(labels)
                 aug_actors = list(dataset.actors)
                 for idx in split["train_idx"]:
-                    aug_y = augment_waveform(waveforms[idx], config.SR_HUBERT)
+                    aug_y = augment_waveform(waveforms[idx], config.SR_HUBERT,
+                                             seed=seed + idx)
                     aug_waveforms.append(aug_y)
                     aug_labels.append(labels[idx])
                     aug_actors.append(dataset.actors[idx])
-                aug_waveforms = aug_waveforms
                 aug_labels = np.array(aug_labels)
                 aug_actors = np.array(aug_actors)
                 n_orig = len(waveforms)
@@ -272,35 +272,46 @@ def run_exp6(dataset: RavdessDataset = None, force: bool = False,
                 train_actor_list = sorted(set(dataset.actors[split["train_idx"]]))
                 actor_to_idx = {a: i for i, a in enumerate(train_actor_list)}
 
+                # Rebuild train_loader with speaker labels baked into the
+                # TensorDataset so labels stay aligned after shuffle.
+                if cfg["augment"]:
+                    grl_wf, grl_act = aug_waveforms, aug_actors
+                    grl_lab, grl_idx = aug_labels, aug_train_idx
+                else:
+                    grl_wf, grl_act = waveforms, dataset.actors
+                    grl_lab, grl_idx = labels, split["train_idx"]
+
+                X_grl = torch.tensor(
+                    np.array([grl_wf[i] for i in grl_idx]),
+                    dtype=torch.float32,
+                )
+                y_emo_grl = torch.tensor(grl_lab[grl_idx], dtype=torch.long)
+                y_spk_grl = torch.tensor(
+                    [actor_to_idx.get(grl_act[i], 0) for i in grl_idx],
+                    dtype=torch.long,
+                )
+                grl_ds = TensorDataset(X_grl, y_emo_grl, y_spk_grl)
+                train_loader = DataLoader(
+                    grl_ds, batch_size=config.BATCH_SIZE, shuffle=True,
+                    num_workers=0, pin_memory=True,
+                )
+
                 max_epochs = 2 if quick else config.MAX_EPOCHS
                 best_f1, best_state, patience = 0.0, None, 0
                 total_steps = max_epochs * len(train_loader)
 
                 for epoch in range(max_epochs):
                     model.train()
-                    for step, (X, y_emo) in enumerate(train_loader):
+                    for step, (X, y_emo, y_spk) in enumerate(train_loader):
                         p = (epoch * len(train_loader) + step) / total_steps
                         alpha = grl_lambda_schedule(p)
 
-                        X, y_emo = X.to(device), y_emo.to(device)
+                        X = X.to(device)
+                        y_emo = y_emo.to(device)
+                        y_spk = y_spk.to(device)
                         emo_logits, spk_logits = model(X, alpha=alpha)
                         loss_emo = emotion_criterion(emo_logits, y_emo)
-
-                        # Speaker labels for this batch
-                        batch_start = step * config.BATCH_SIZE
-                        if cfg["augment"]:
-                            batch_actors = aug_actors[aug_train_idx[batch_start:batch_start + len(y_emo)]]
-                        else:
-                            batch_actors = dataset.actors[
-                                split["train_idx"][batch_start:batch_start + len(y_emo)]
-                            ]
-                        y_spk = torch.tensor(
-                            [actor_to_idx.get(a, 0) for a in batch_actors],
-                            dtype=torch.long,
-                        ).to(device)
-                        y_spk = y_spk[:len(spk_logits)]
-
-                        loss_spk = speaker_criterion(spk_logits[:len(y_spk)], y_spk)
+                        loss_spk = speaker_criterion(spk_logits, y_spk)
                         loss = loss_emo + loss_spk
 
                         optimizer.zero_grad()
@@ -343,12 +354,7 @@ def run_exp6(dataset: RavdessDataset = None, force: bool = False,
                     if isinstance(model, xHuBERTWithGRL):
                         logits, _, emb = model(X, alpha=0.0, return_embedding=True)
                     else:
-                        logits, emb = model(X, return_embedding=True) if hasattr(model, 'base') \
-                            else (model(X, return_embedding=True) if True else None)
-                        if isinstance(logits, tuple):
-                            logits, emb = logits
-                        else:
-                            emb = None
+                        logits, emb = model(X, return_embedding=True)
                     test_preds.extend(logits.argmax(-1).cpu().numpy())
                     test_labels_list.extend(y.numpy())
                     if emb is not None:

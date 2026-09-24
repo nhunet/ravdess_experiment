@@ -120,7 +120,7 @@ def run_exp4(dataset: RavdessDataset = None, seeds: list[int] = None,
                 cleanup_gpu()
 
     df = pd.DataFrame(all_rows)
-    out_csv = os.path.join(config.SAVE_DIR, "results_exp4_ablation.csv")
+    out_csv = os.path.join(config.CSV_DIR, "results_exp4_ablation.csv")
     df.to_csv(out_csv, index=False)
     print(f"\n[INFO] Saved {out_csv}")
 

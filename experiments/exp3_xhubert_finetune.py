@@ -65,7 +65,7 @@ def train_one_fold(model, train_loader, val_loader, device, seed, fold_name):
     )
     total_steps = len(train_loader) * config.MAX_EPOCHS // config.GRAD_ACCUM_STEPS
     scheduler = OneCycleLR(
-        optimizer, max_lr=[config.BACKBONE_LR, config.HEAD_LR],
+        optimizer, max_lr=[g["lr"] for g in optimizer.param_groups],
         total_steps=total_steps, pct_start=config.WARMUP_FRACTION,
         anneal_strategy="linear",
     )
@@ -186,7 +186,7 @@ def run_exp3(dataset: RavdessDataset = None, seeds: list[int] = None,
                     )
                 else:
                     # 5-fold: split train into train/val (80/20)
-                    train_idx = split["train_idx"]
+                    train_idx = split["train_idx"].copy()
                     np.random.shuffle(train_idx)
                     val_size = max(1, len(train_idx) // 5)
                     val_idx_cv = train_idx[:val_size]
@@ -232,7 +232,7 @@ def run_exp3(dataset: RavdessDataset = None, seeds: list[int] = None,
                 layer_w = model.get_layer_weights()
                 if layer_w is not None:
                     lw_path = os.path.join(
-                        config.SAVE_DIR,
+                        config.EMB_DIR,
                         f"layer_weights_fold{fold_idx}_seed{seed}.npy",
                     )
                     np.save(lw_path, layer_w.numpy())
@@ -249,11 +249,11 @@ def run_exp3(dataset: RavdessDataset = None, seeds: list[int] = None,
                         model, trainval_loader, device,
                     )
                     np.save(os.path.join(
-                        config.SAVE_DIR,
+                        config.EMB_DIR,
                         f"embeddings_trainval_fold{fold_idx}_seed{seed}.npy",
                     ), emb_trainval)
                     np.save(os.path.join(
-                        config.SAVE_DIR,
+                        config.EMB_DIR,
                         f"labels_trainval_fold{fold_idx}_seed{seed}.npy",
                     ), lab_trainval)
 
@@ -262,7 +262,7 @@ def run_exp3(dataset: RavdessDataset = None, seeds: list[int] = None,
                         model, test_loader, device,
                     )
                     np.save(os.path.join(
-                        config.SAVE_DIR,
+                        config.EMB_DIR,
                         f"embeddings_test_fold{fold_idx}_seed{seed}.npy",
                     ), emb_test)
 
@@ -290,7 +290,7 @@ def run_exp3(dataset: RavdessDataset = None, seeds: list[int] = None,
 
     # Save combined results
     df = pd.DataFrame(all_rows)
-    out_csv = os.path.join(config.SAVE_DIR, "results_exp3_xhubert.csv")
+    out_csv = os.path.join(config.CSV_DIR, "results_exp3_xhubert.csv")
     df.to_csv(out_csv, index=False)
     print(f"\n[INFO] Saved {out_csv}")
 

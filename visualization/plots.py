@@ -16,7 +16,7 @@ def set_style():
 
 
 def save_fig(fig, name: str):
-    path = os.path.join(config.SAVE_DIR, name)
+    path = os.path.join(config.FIG_DIR, name)
     fig.savefig(path, dpi=config.FIGURE_DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"[INFO] Saved {path}")

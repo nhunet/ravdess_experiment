@@ -84,27 +84,30 @@ class AttGateFusion(nn.Module):
 
 
 class CrossAttentionFusion(nn.Module):
-    """F3: Cross-attention between FT-embedding and handcrafted features."""
+    """F3: Cross-attention — FT embedding query attends over MFCC and Prosody tokens."""
 
-    def __init__(self, ft_dim: int = 256, handcrafted_dim: int = 274,
-                 n_heads: int = 4, n_classes: int = 8):
+    def __init__(self, ft_dim: int = 256, mfcc_dim: int = 240,
+                 prosody_dim: int = 34, n_heads: int = 4,
+                 n_classes: int = 8, proj_dim: int = 128):
         super().__init__()
-        self.proj_ft = nn.Linear(ft_dim, 128)
-        self.proj_hc = nn.Linear(handcrafted_dim, 128)
-        self.cross_attn = nn.MultiheadAttention(128, n_heads, batch_first=True)
+        self.proj_ft = nn.Linear(ft_dim, proj_dim)
+        self.proj_mfcc = nn.Linear(mfcc_dim, proj_dim)
+        self.proj_prosody = nn.Linear(prosody_dim, proj_dim)
+        self.cross_attn = nn.MultiheadAttention(proj_dim, n_heads, batch_first=True)
         self.classifier = nn.Sequential(
-            nn.Linear(128, 64),
+            nn.Linear(proj_dim, 64),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(64, n_classes),
         )
 
-    def forward(self, ft_emb: torch.Tensor,
-                handcrafted: torch.Tensor) -> torch.Tensor:
-        # Treat each as single-token sequence for cross-attention
-        q = self.proj_ft(ft_emb).unsqueeze(1)    # (B, 1, 128)
-        kv = self.proj_hc(handcrafted).unsqueeze(1)  # (B, 1, 128)
-        attn_out, _ = self.cross_attn(q, kv, kv)  # (B, 1, 128)
+    def forward(self, ft_emb: torch.Tensor, mfcc: torch.Tensor,
+                prosody: torch.Tensor) -> torch.Tensor:
+        q = self.proj_ft(ft_emb).unsqueeze(1)        # (B, 1, proj_dim)
+        k1 = self.proj_mfcc(mfcc).unsqueeze(1)       # (B, 1, proj_dim)
+        k2 = self.proj_prosody(prosody).unsqueeze(1)  # (B, 1, proj_dim)
+        kv = torch.cat([k1, k2], dim=1)              # (B, 2, proj_dim)
+        attn_out, _ = self.cross_attn(q, kv, kv)     # (B, 1, proj_dim)
         return self.classifier(attn_out.squeeze(1))
 
 

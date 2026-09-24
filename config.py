@@ -6,7 +6,11 @@ from pathlib import Path
 # ─── Paths ───────────────────────────────────────────────────────────────────
 RAVDESS_ROOT = os.environ.get("RAVDESS_ROOT", "./RAVDESS")
 SAVE_DIR = os.environ.get("XHUBERT_SAVE_DIR", "./results")
+CSV_DIR = os.path.join(SAVE_DIR, "csv")
+FIG_DIR = os.path.join(SAVE_DIR, "figures")
 CKPT_DIR = os.path.join(SAVE_DIR, "checkpoints")
+EMB_DIR = os.path.join(SAVE_DIR, "embeddings")
+LOG_DIR = os.path.join(SAVE_DIR, "logs")
 
 # ─── Dataset ─────────────────────────────────────────────────────────────────
 NUM_ACTORS = 24
@@ -20,9 +24,9 @@ EMOTION_NAMES = list(EMOTION_LABELS.values())
 # ─── Audio ───────────────────────────────────────────────────────────────────
 SR_HANDCRAFTED = 22_050
 SR_HUBERT = 16_000
-DURATION_SEC = 3.0
-MAX_SAMPLES_HANDCRAFTED = int(SR_HANDCRAFTED * DURATION_SEC)  # 66150
-MAX_SAMPLES_HUBERT = int(SR_HUBERT * DURATION_SEC)            # 48000
+DURATION_SEC = 4.0
+MAX_SAMPLES_HANDCRAFTED = int(SR_HANDCRAFTED * DURATION_SEC)  # 88200
+MAX_SAMPLES_HUBERT = int(SR_HUBERT * DURATION_SEC)            # 64000
 
 # ─── Feature extraction ─────────────────────────────────────────────────────
 N_MFCC = 40
@@ -46,8 +50,6 @@ MAX_EPOCHS = 30
 PATIENCE = 6
 BATCH_SIZE = 8
 GRAD_ACCUM_STEPS = 2
-SPECAUGMENT_PROB = 0.03
-SPECAUGMENT_LENGTH = 10
 LABEL_SMOOTHING = 0.05
 DROPOUT = 0.1
 EMBEDDING_DIM = 256

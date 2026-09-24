@@ -54,8 +54,8 @@ def train_fusion_model(model, train_data, val_data, device,
                         entropy = model.entropy_loss(gate_w)
                         loss = loss - config.GATE_ENTROPY_LAMBDA * entropy
             elif model_type == "crossattn":
-                ft, hc, y = [b.to(device) for b in batch]
-                logits = model(ft, hc)
+                ft, mfcc, pros, y = [b.to(device) for b in batch]
+                logits = model(ft, mfcc, pros)
                 loss = criterion(logits, y)
             else:  # baselines
                 x, y = batch[0].to(device), batch[1].to(device)
@@ -80,8 +80,8 @@ def train_fusion_model(model, train_data, val_data, device,
                         logits, gw = model(ft, mfcc, pros)
                         gate_weights_all.append(gw.cpu().numpy())
                 elif model_type == "crossattn":
-                    ft, hc, y = [b.to(device) for b in batch]
-                    logits = model(ft, hc)
+                    ft, mfcc, pros, y = [b.to(device) for b in batch]
+                    logits = model(ft, mfcc, pros)
                 else:
                     x, y = batch[0].to(device), batch[1].to(device)
                     logits = model(x)
@@ -113,7 +113,7 @@ def run_exp5(dataset_hc: RavdessDataset = None, force: bool = False):
     set_seed(config.DEFAULT_SEED)
     ensure_dirs()
 
-    out_csv = os.path.join(config.SAVE_DIR, "results_exp5_fusion.csv")
+    out_csv = os.path.join(config.CSV_DIR, "results_exp5_fusion.csv")
     if os.path.exists(out_csv) and not force:
         print(f"[INFO] Exp5 already done: {out_csv}")
         return pd.read_csv(out_csv)
@@ -144,13 +144,13 @@ def run_exp5(dataset_hc: RavdessDataset = None, force: bool = False):
 
         # Load precomputed embeddings from Exp3
         emb_trainval_path = os.path.join(
-            config.SAVE_DIR, f"embeddings_trainval_fold{fold_idx}_seed{seed}.npy"
+            config.EMB_DIR, f"embeddings_trainval_fold{fold_idx}_seed{seed}.npy"
         )
         emb_test_path = os.path.join(
-            config.SAVE_DIR, f"embeddings_test_fold{fold_idx}_seed{seed}.npy"
+            config.EMB_DIR, f"embeddings_test_fold{fold_idx}_seed{seed}.npy"
         )
         lab_trainval_path = os.path.join(
-            config.SAVE_DIR, f"labels_trainval_fold{fold_idx}_seed{seed}.npy"
+            config.EMB_DIR, f"labels_trainval_fold{fold_idx}_seed{seed}.npy"
         )
 
         if not os.path.exists(emb_trainval_path):
@@ -216,13 +216,11 @@ def run_exp5(dataset_hc: RavdessDataset = None, force: bool = False):
                 test_ds = TensorDataset(emb_te, mfcc_te, pros_te, lab_te)
             elif model_type == "crossattn":
                 model = model_cls()
-                hc_train = torch.cat([mfcc_t[train_sl], pros_t[train_sl]], dim=-1)
-                hc_val = torch.cat([mfcc_t[val_sl], pros_t[val_sl]], dim=-1)
-                hc_test = torch.cat([mfcc_te, pros_te], dim=-1)
-
-                train_ds = TensorDataset(emb_t[train_sl], hc_train, lab_t[train_sl])
-                val_ds = TensorDataset(emb_t[val_sl], hc_val, lab_t[val_sl])
-                test_ds = TensorDataset(emb_te, hc_test, lab_te)
+                train_ds = TensorDataset(emb_t[train_sl], mfcc_t[train_sl],
+                                          pros_t[train_sl], lab_t[train_sl])
+                val_ds = TensorDataset(emb_t[val_sl], mfcc_t[val_sl],
+                                        pros_t[val_sl], lab_t[val_sl])
+                test_ds = TensorDataset(emb_te, mfcc_te, pros_te, lab_te)
             elif model_type == "baseline_emb":
                 model = model_cls()
                 train_ds = TensorDataset(emb_t[train_sl], lab_t[train_sl])
@@ -262,8 +260,8 @@ def run_exp5(dataset_hc: RavdessDataset = None, force: bool = False):
                         else:
                             logits, _ = model(ft, mfcc, pros)
                     elif model_type == "crossattn":
-                        ft, hc, y = [b.to(device) for b in batch]
-                        logits = model(ft, hc)
+                        ft, mfcc, pros, y = [b.to(device) for b in batch]
+                        logits = model(ft, mfcc, pros)
                     else:
                         x, y = batch[0].to(device), batch[1].to(device)
                         logits = model(x)

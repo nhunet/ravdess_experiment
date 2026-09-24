@@ -92,20 +92,21 @@ class Timer:
 # ─── Checkpoint / Results ────────────────────────────────────────────────────
 
 def ensure_dirs():
-    os.makedirs(config.SAVE_DIR, exist_ok=True)
-    os.makedirs(config.CKPT_DIR, exist_ok=True)
+    for d in [config.SAVE_DIR, config.CSV_DIR, config.FIG_DIR,
+              config.CKPT_DIR, config.EMB_DIR, config.LOG_DIR]:
+        os.makedirs(d, exist_ok=True)
 
 
 def save_fold_result(result: dict, exp_name: str, fold: int, seed: int = 42):
     ensure_dirs()
-    path = os.path.join(config.SAVE_DIR, f"{exp_name}_fold{fold}_seed{seed}.json")
+    path = os.path.join(config.LOG_DIR, f"{exp_name}_fold{fold}_seed{seed}.json")
     with open(path, "w") as f:
         json.dump(result, f, indent=2, default=_json_default)
     print(f"[INFO] Saved {path}")
 
 
 def load_fold_result(exp_name: str, fold: int, seed: int = 42):
-    path = os.path.join(config.SAVE_DIR, f"{exp_name}_fold{fold}_seed{seed}.json")
+    path = os.path.join(config.LOG_DIR, f"{exp_name}_fold{fold}_seed{seed}.json")
     if os.path.exists(path):
         with open(path) as f:
             return json.load(f)
@@ -150,15 +151,17 @@ def _json_default(obj):
 
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+    all_labels = list(range(config.NUM_EMOTIONS))
     return {
         "accuracy": float(accuracy_score(y_true, y_pred)) * 100,
-        "f1_macro": float(f1_score(y_true, y_pred, average="macro")) * 100,
-        "precision_macro": float(precision_score(y_true, y_pred, average="macro", zero_division=0)) * 100,
-        "recall_macro": float(recall_score(y_true, y_pred, average="macro", zero_division=0)) * 100,
+        "f1_macro": float(f1_score(y_true, y_pred, average="macro", labels=all_labels, zero_division=0)) * 100,
+        "precision_macro": float(precision_score(y_true, y_pred, average="macro", labels=all_labels, zero_division=0)) * 100,
+        "recall_macro": float(recall_score(y_true, y_pred, average="macro", labels=all_labels, zero_division=0)) * 100,
     }
 
 
 def compute_per_class_f1(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     from sklearn.metrics import f1_score
-    f1s = f1_score(y_true, y_pred, average=None)
+    all_labels = list(range(config.NUM_EMOTIONS))
+    f1s = f1_score(y_true, y_pred, average=None, labels=all_labels, zero_division=0)
     return {config.EMOTION_NAMES[i]: float(f1s[i]) * 100 for i in range(len(f1s))}
